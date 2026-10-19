@@ -1,0 +1,334 @@
+
+{
+  "name": "K8s + Grafana AI Agent - Full Read Only",
+  "nodes": [
+    {
+      "id": "99498faf-c7d0-4a75-a373-8fbf030d7f5a",
+      "name": "When chat message received",
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.1,
+      "position": [0, 260],
+      "parameters": {
+        "options": {
+          "responseMode": "lastNode"
+        }
+      }
+    },
+    {
+      "id": "8c278330-cf32-4d56-8771-a40a8d3e719a",
+      "name": "AI Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 2.2,
+      "position": [230, 260],
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.chatInput }}",
+        "options": {
+          "systemMessage": "你是 Kubernetes 與 Grafana 唯讀維運助理。使用繁體中文。根據使用者問題自由選擇 Kubernetes MCP 與 Grafana MCP 的可用唯讀工具。可查詢 Node、Pod、Deployment、Service、PVC、Events、Logs、Dashboard、Panel、Alerts、Metrics 等，不限制在這些例子。若問題僅是清單就直接列清單。需要時先探索資源或 Metrics，不能捏造。Kubernetes Metrics 優先參考已知有資料的 mimir-infra；mimir-apps 目前無數據，但不要永久排除其他已驗證來源。Dashboard Panel 圖片只需透過 Grafana 工具確認 dashboardUid、panelId 和變數，絕對不要在 Agent 內呼叫圖片渲染工具；不要因為過去渲染 Timeout 而拒絕輸出圖片請求，下游專門負責產圖。使用者要求顯示 Panel 時，先找到唯一 Panel；若有兩個同名 Panel 又無法判斷，詢問使用者，不自行選。Gauge、Stat、Table、Time series 均可。若要求動態 Metrics 趨勢，探索實際存在的指標，先查有資料再輸出 PromQL。不讀 Secret、不寫入或執行危險操作。回應只輸出單一合法 JSON，沒有 markdown code fence。格式如下：一般查詢 {\"responseType\":\"text\",\"answer\":\"繁體中文回答\"}；Panel 圖片 {\"responseType\":\"dashboard_panel\",\"answer\":\"簡短說明\",\"panel\":{\"dashboardUid\":\"實際UID\",\"panelId\":24,\"title\":\"面板標題\",\"from\":\"now-1h\",\"to\":\"now\",\"variables\":{\"node\":\"已確認的值\"}}}；動態 Metrics 圖 {\"responseType\":\"metric_chart\",\"answer\":\"說明\",\"chart\":{\"datasourceUid\":\"已驗證UID\",\"query\":\"實際PromQL\",\"from\":\"now-1h\",\"to\":\"now\",\"title\":\"圖表標題\"}}。使用者沒要求圖時回 text。絕對時間帶上 +08:00。查不到資料時回 text 說明。",
+          "maxIterations": 10
+        }
+      }
+    },
+    {
+      "id": "c9739c63-16d5-4f84-a55c-b42b90c97806",
+      "name": "Gemma Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.2,
+      "position": [50, 540],
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "REPLACE_WITH_YOUR_GEMMA_MODEL",
+          "mode": "id"
+        },
+        "options": {
+          "temperature": 0.2,
+          "maxTokens": 3072
+        }
+      }
+    },
+    {
+      "id": "832909b9-aa04-404d-a7b0-cef266ddab0d",
+      "name": "Simple Memory",
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "typeVersion": 1.3,
+      "position": [260, 540],
+      "parameters": {
+        "sessionIdType": "fromInput",
+        "sessionKey": "={{ $(\"When chat message received\").first().json.sessionId }}",
+        "contextWindowLength": 3
+      }
+    },
+    {
+      "id": "03c882fe-fe7f-471b-a8e4-ff9ca7e0ccff",
+      "name": "Kubernetes MCP Tool",
+      "type": "@n8n/n8n-nodes-langchain.mcpClientTool",
+      "typeVersion": 1.2,
+      "position": [470, 540],
+      "parameters": {
+        "endpointUrl": "http://REPLACE-K8S-MCP-ENDPOINT/mcp",
+        "serverTransport": "httpStreamable",
+        "authentication": "none",
+        "include": "all",
+        "options": {
+          "timeout": 60000
+        }
+      }
+    },
+    {
+      "id": "6fe81ce5-3aa1-4875-9bc1-cc766baced68",
+      "name": "Grafana MCP Tool",
+      "type": "@n8n/n8n-nodes-langchain.mcpClientTool",
+      "typeVersion": 1.2,
+      "position": [680, 540],
+      "parameters": {
+        "endpointUrl": "http://grafana-mcp.grafana-mcp.svc.cluster.local:8000/mcp",
+        "serverTransport": "httpStreamable",
+        "authentication": "none",
+        "include": "all",
+        "options": {
+          "timeout": 60000
+        }
+      }
+    },
+    {
+      "id": "d1782402-00ec-4831-93ca-27ff7c3e0343",
+      "name": "Parse Agent Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [470, 260],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const raw = $input.first().json.output ?? $input.first().json.text ?? '';\nlet d;\ntry {\n  const s = typeof raw === 'string' ? raw.replace(/^```(?:json)?\\s*/i,'').replace(/\\s*```$/,'').trim() : raw;\n  d = typeof s === 'string' ? JSON.parse(s) : s;\n  if (!d || typeof d !== 'object') throw new Error('not object');\n} catch {\n  return [{json:{responseType:'text',answer:String(raw || 'AI 沒有回傳可解析的內容')}}];\n}\nconst answer=String(d.answer||'');\nif(d.responseType==='dashboard_panel' && d.panel){return [{json:{responseType:'dashboard_panel',answer,dashboardUid:d.panel.dashboardUid,panelId:d.panel.panelId,title:d.panel.title||'Grafana Panel',from:d.panel.from||'now-15m',to:d.panel.to||'now',variables:d.panel.variables||{}}}];}\nif(d.responseType==='metric_chart' && d.chart){return [{json:{responseType:'metric_chart',answer,datasourceUid:d.chart.datasourceUid,query:d.chart.query,title:d.chart.title||'Metrics 圖表',from:d.chart.from||'now-15m',to:d.chart.to||'now'}}];}\nreturn [{json:{responseType:'text',answer:answer||'沒有取得可確認的查詢結果。'}}];"
+      }
+    },
+    {
+      "id": "7783b460-c0ff-42e9-b26a-c149fdf15517",
+      "name": "Switch Response",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [680, 260],
+      "parameters": {
+        "mode": "rules",
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.responseType }}",
+                    "rightValue": "text",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "text"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.responseType }}",
+                    "rightValue": "dashboard_panel",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "dashboard_panel"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.responseType }}",
+                    "rightValue": "metric_chart",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "metric_chart"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "53455f16-b0bc-4631-89e7-a67c679f954c",
+      "name": "Format Text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [970, 20],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return [{json:{output:String($input.first().json.answer||\"沒有結果\")}}];"
+      }
+    },
+    {
+      "id": "4e1d3eae-e724-4ac2-8ea4-3e08ae84eb40",
+      "name": "Validate Panel & Build URLs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [970, 220],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const d=$input.first().json;\nconst BASE='https://utckfk8sgrafana.k8skf.unimicron.com';\nconst uid=String(d.dashboardUid||'').trim(); const panelId=Number(d.panelId);\nif(!/^[a-zA-Z0-9_-]+$/.test(uid)||!Number.isSafeInteger(panelId)||panelId<=0)throw Error('Dashboard UID 或 Panel ID 無效');\nconst from=String(d.from||'now-15m'),to=String(d.to||'now');\nfunction ms(v){if(v==='now')return Date.now(); const m=/^now-(\\d+)([smhdw])$/.exec(v); if(m)return Date.now()-Number(m[1])*({s:1e3,m:6e4,h:36e5,d:864e5,w:6048e5}[m[2]]); if(!/(Z|[+-]\\d\\d:\\d\\d)$/i.test(v))throw Error('絕對時間需帶時區'); const t=Date.parse(v);if(!Number.isFinite(t))throw Error('時間錯誤');return t;}\nconst begin=ms(from),end=ms(to); if(end<=begin||end-begin>7*864e5||end>Date.now()+6e4)throw Error('時間範圍不合法');\nconst vars=d.variables||{};\nif(typeof vars!=='object'||vars===null||Array.isArray(vars)||Object.keys(vars).length>30)throw Error('variables 不合法');\nconst p=new URLSearchParams({orgId:'1',panelId:String(panelId),from,to,width:'1200',height:'650',tz:'Asia/Taipei'});\nconst q=new URLSearchParams({orgId:'1',from,to,timezone:'Asia/Taipei'});\nfor(const [rawKey,value] of Object.entries(vars)){const k=rawKey.replace(/^var-/,'');if(!/^[A-Za-z_][A-Za-z0-9_-]*$/.test(k)||typeof value!=='string'||value.length>300)throw Error('variable 不合法: '+k);p.append('var-'+k,value);q.append('var-'+k,value);}\nreturn [{json:{...d,renderUrl:`${BASE}/render/d-solo/${uid}?${p.toString()}`,dashboardUrl:`${BASE}/d/${uid}?${q.toString()}`}}];"
+      }
+    },
+    {
+      "id": "9d83efaf-8cb5-4887-97ea-8520a6ad98fb",
+      "name": "Fetch Grafana Panel PNG",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1210, 220],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.renderUrl }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 120000,
+          "response": {
+            "response": {
+              "responseFormat": "file",
+              "outputPropertyName": "data"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "38287f3d-29ef-4ece-91b1-8f0ee49cad55",
+      "name": "Format Panel Image",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1440, 220],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const item=$input.first();const k='data';if(!item.binary?.[k])throw Error('沒有取得 PNG Binary');if(item.binary[k].mimeType!=='image/png')throw Error('回傳不是 PNG: '+item.binary[k].mimeType);const b=await this.helpers.getBinaryDataBuffer(0,k);const d=$('Validate Panel & Build URLs').first().json;return [{json:{output:`### ${d.title}\\n\\n${d.answer}\\n\\n![Grafana Panel](data:image/png;base64,${b.toString('base64')})\\n\\n[開啟 Dashboard](${d.dashboardUrl})\\n\\n查詢範圍：${d.from} ～ ${d.to}`}}];"
+      }
+    },
+    {
+      "id": "3c39204e-48bc-431a-9155-4f731bdc3d3e",
+      "name": "Validate Metric Chart",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [970, 440],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const d=$input.first().json;const uid=String(d.datasourceUid||''),query=String(d.query||'').trim();if(!/^[\\w-]+$/.test(uid)||!query||query.length>4000)throw Error('無效的 Datasource 或 PromQL');const from=String(d.from||'now-15m'),to=String(d.to||'now');function ms(v){if(v==='now')return Date.now();const m=/^now-(\\d+)([smhdw])$/.exec(v);if(m)return Date.now()-Number(m[1])*({s:1e3,m:6e4,h:36e5,d:864e5,w:6048e5}[m[2]]);if(!/(Z|[+-]\\d\\d:\\d\\d)$/i.test(v))throw Error('時間格式');return Date.parse(v);}const a=ms(from),b=ms(to);if(!Number.isFinite(a)||!Number.isFinite(b)||b<=a||b-a>7*864e5||b>Date.now()+6e4)throw Error('時間範圍不合法');return [{json:{...d,datasourceUid:uid,query,from,to,start:a,end:b}}];"
+      }
+    },
+    {
+      "id": "215a96d4-b923-46da-b994-011501e91baf",
+      "name": "Grafana Explore Render - CHECK SETTINGS",
+      "type": "@n8n/n8n-nodes-langchain.mcpClient",
+      "typeVersion": 1.1,
+      "position": [1210, 440],
+      "parameters": {
+        "endpointUrl": "http://grafana-mcp.grafana-mcp.svc.cluster.local:8000/mcp",
+        "serverTransport": "httpStreamable",
+        "authentication": "none",
+        "tool": "get_panel_image",
+        "inputMode": "json",
+        "jsonInput": "={{ JSON.stringify({ explore: { datasourceUid: $json.datasourceUid, queries:[{refId:\"A\",expr:$json.query,datasource:{uid:$json.datasourceUid}}] }, timeRange:{from:$json.from,to:$json.to},width:1200,height:650 }) }}",
+        "options": {
+          "convertToBinary": true,
+          "timeout": 120000
+        }
+      }
+    },
+    {
+      "id": "bd9bd5fd-0af4-461d-9ff9-9b25c17bb474",
+      "name": "Format Metric Image",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1440, 440],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const i=$input.first();const k='data_0';if(!i.binary?.[k])throw Error('Grafana MCP 未回傳 PNG Binary data_0');const b=await this.helpers.getBinaryDataBuffer(0,k);const d=$('Validate Metric Chart').first().json;const tw=x=>new Date(x).toLocaleString('zh-TW',{timeZone:'Asia/Taipei',hour12:false});return [{json:{output:`### ${d.title}\\n\\n${d.answer}\\n\\n![Metrics](data:image/png;base64,${b.toString('base64')})\\n\\n台灣時間：${tw(d.start)} ～ ${tw(d.end)}`}}];"
+      }
+    }
+  ],
+  "connections": {
+    "When chat message received": {
+      "main": [[{"node": "AI Agent", "type": "main", "index": 0}]]
+    },
+    "Gemma Chat Model": {
+      "ai_languageModel": [[{"node": "AI Agent", "type": "ai_languageModel", "index": 0}]]
+    },
+    "Simple Memory": {
+      "ai_memory": [[{"node": "AI Agent", "type": "ai_memory", "index": 0}]]
+    },
+    "Kubernetes MCP Tool": {
+      "ai_tool": [[{"node": "AI Agent", "type": "ai_tool", "index": 0}]]
+    },
+    "Grafana MCP Tool": {
+      "ai_tool": [[{"node": "AI Agent", "type": "ai_tool", "index": 0}]]
+    },
+    "AI Agent": {
+      "main": [[{"node": "Parse Agent Result", "type": "main", "index": 0}]]
+    },
+    "Parse Agent Result": {
+      "main": [[{"node": "Switch Response", "type": "main", "index": 0}]]
+    },
+    "Switch Response": {
+      "main": [
+        [{"node": "Format Text", "type": "main", "index": 0}],
+        [{"node": "Validate Panel & Build URLs", "type": "main", "index": 0}],
+        [{"node": "Validate Metric Chart", "type": "main", "index": 0}]
+      ]
+    },
+    "Validate Panel & Build URLs": {
+      "main": [[{"node": "Fetch Grafana Panel PNG", "type": "main", "index": 0}]]
+    },
+    "Fetch Grafana Panel PNG": {
+      "main": [[{"node": "Format Panel Image", "type": "main", "index": 0}]]
+    },
+    "Validate Metric Chart": {
+      "main": [[{"node": "Grafana Explore Render - CHECK SETTINGS", "type": "main", "index": 0}]]
+    },
+    "Grafana Explore Render - CHECK SETTINGS": {
+      "main": [[{"node": "Format Metric Image", "type": "main", "index": 0}]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "pinData": {},
+  "tags": []
+}
