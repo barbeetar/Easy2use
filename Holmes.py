@@ -1,14 +1,17 @@
 
 """
 title: HolmesGPT SRE
-description: Kubernetes SRE Agent with Grafana PNG, auto-resize and live tool progress
-version: 2.5.0
+description: Kubernetes SRE Agent with Grafana PNG and Prometheus trend charts
+version: 5.0.0
 """
 
 import base64
 import html
 import json
+import math
 import re
+
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
 import httpx
@@ -20,64 +23,43 @@ class Pipe:
     class Valves(BaseModel):
 
         HOLMES_URL: str = Field(
-            default="http://holmesgpt-holmes.holmesgpt.svc.cluster.local:80",
-            description="HolmesGPT API URL",
+            default="http://holmesgpt-holmes.holmesgpt.svc.cluster.local:80"
         )
 
-        MODEL: str = Field(
-            default="gemma-local",
-            description="HolmesGPT model alias",
-        )
+        MODEL: str = Field(default="gemma-local")
 
         API_KEY: str = Field(
             default="",
-            description="HolmesGPT API key, if required",
             json_schema_extra={"input": {"type": "password"}},
         )
 
-        TIMEOUT: int = Field(
-            default=300,
-            ge=30,
-            le=900,
-        )
+        TIMEOUT: int = Field(default=300)
 
-        SHOW_TOOL_HISTORY: bool = Field(
-            default=True,
-        )
+        SHOW_TOOL_HISTORY: bool = Field(default=True)
 
         GRAFANA_URL: str = Field(
-            default="http://grafana.monitoring.svc.cluster.local:80",
-            description="Internal Grafana service URL",
+            default="http://grafana.monitoring.svc.cluster.local:80"
         )
 
         GRAFANA_TOKEN: str = Field(
             default="",
-            description="Grafana Viewer Token",
             json_schema_extra={"input": {"type": "password"}},
         )
 
-        GRAFANA_ORG_ID: int = Field(
-            default=1,
-        )
+        GRAFANA_ORG_ID: int = Field(default=1)
 
-        SHOW_RENDERED_IMAGES: bool = Field(
-            default=True,
-        )
+        SHOW_RENDERED_IMAGES: bool = Field(default=True)
 
-        MAX_IMAGES: int = Field(
-            default=2,
-            ge=1,
-            le=4,
-        )
+        SHOW_PROMETHEUS_CHARTS: bool = Field(default=True)
 
-        MAX_IMAGE_BYTES: int = Field(
-            default=1500000,
-            ge=100000,
-            le=3000000,
-        )
+        MAX_IMAGES: int = Field(default=2, ge=1, le=4)
+
+        MAX_CHARTS: int = Field(default=3, ge=1, le=5)
+
+        MAX_IMAGE_BYTES: int = Field(default=1500000)
 
         REMOVE_TOOL_IMAGE_REFERENCES: bool = Field(
-            default=True,
+            default=True
         )
 
     def __init__(self):
@@ -85,39 +67,406 @@ class Pipe:
         self.valves = self.Valves()
 
     # =========================================================
-    # Clean internal image references
+    # Helpers
     # =========================================================
 
     @staticmethod
-    def clean_tool_images(value):
+    def clean_images(text):
 
-        text = str(value or "")
+        text = str(text or "")
 
-        # HolmesGPT internal image reference is not
-        # directly supported by Open WebUI Markdown.
-
-        text = re.sub(
+        return re.sub(
             r"!\[([^\]]*)\]\(\s*tool-image://[^)\s]+\s*\)",
-            lambda m: (
-                "\n\n*" + m.group(1) + "*\n\n"
-                if m.group(1).strip()
-                else ""
-            ),
+            lambda m: f"\n\n*{m.group(1)}*\n\n",
             text,
             flags=re.IGNORECASE,
+        ).strip()
+
+    @staticmethod
+    def decode_prometheus_result(result):
+
+        data = result.get("data")
+
+        # HolmesGPT 0.46.0 returns Prometheus output
+        # as a JSON-encoded string.
+
+        for _ in range(3):
+
+            if isinstance(data, str):
+                try:
+                    data = json.loads(data)
+                except json.JSONDecodeError:
+                    return None
+
+            if not isinstance(data, dict):
+                return None
+
+            if (
+                data.get("status") == "error"
+                or data.get("error_message")
+            ):
+                return None
+
+            if isinstance(data.get("data"), dict):
+                data = data["data"]
+                continue
+
+            break
+
+        if not isinstance(data, dict):
+            return None
+
+        if data.get("resultType") != "matrix":
+            return None
+
+        if not isinstance(data.get("result"), list):
+            return None
+
+        return data
+
+    @staticmethod
+    def chart_unit(output_type):
+
+        t = str(output_type or "").lower()
+
+        if "memory" in t or "byte" in t:
+            return "MiB", 1024 * 1024
+
+        if "cpu" in t:
+            return "CPU cores", 1
+
+        if "percent" in t or "percentage" in t:
+            return "%", 1
+
+        return "Value", 1
+
+    @staticmethod
+    def chart_html(job):
+
+        params = job.get("params") or {}
+        matrix = job.get("matrix") or {}
+
+        unit, divisor = Pipe.chart_unit(
+            params.get("output_type")
         )
 
-        text = re.sub(
-            r"tool-image://[A-Za-z0-9_.:/-]+",
-            "",
-            text,
-            flags=re.IGNORECASE,
+        series = []
+
+        for item in matrix.get("result", [])[:4]:
+
+            if not isinstance(item, dict):
+                continue
+
+            metric = item.get("metric") or {}
+            values = item.get("values") or []
+
+            points = []
+
+            for pair in values[:240]:
+
+                try:
+                    timestamp = float(pair[0])
+                    value = float(pair[1]) / divisor
+
+                    if not (
+                        math.isfinite(timestamp)
+                        and math.isfinite(value)
+                    ):
+                        continue
+
+                    points.append((timestamp, value))
+
+                except (TypeError, ValueError, IndexError):
+                    continue
+
+            if not points:
+                continue
+
+            name = (
+                metric.get("pod")
+                or metric.get("container")
+                or metric.get("instance")
+                or metric.get("job")
+                or "Series"
+            )
+
+            series.append({
+                "name": str(name),
+                "points": points,
+            })
+
+        if not series:
+            return None
+
+        all_points = [
+            point
+            for s in series
+            for point in s["points"]
+        ]
+
+        min_x = min(p[0] for p in all_points)
+        max_x = max(p[0] for p in all_points)
+
+        min_y = min(p[1] for p in all_points)
+        max_y = max(p[1] for p in all_points)
+
+        if min_x == max_x:
+            max_x = min_x + 1
+
+        # Include zero for nonnegative CPU / Memory values.
+        if min_y >= 0:
+            min_y = 0
+
+        if min_y == max_y:
+            max_y = min_y + 1
+
+        padding_y = (max_y - min_y) * 0.08
+        max_y += padding_y
+
+        width = 1000
+        height = 400
+
+        left = 76
+        right = 30
+        top = 24
+        bottom = 62
+
+        plot_width = width - left - right
+        plot_height = height - top - bottom
+
+        def sx(t):
+            return (
+                left
+                + (t - min_x)
+                / (max_x - min_x)
+                * plot_width
+            )
+
+        def sy(v):
+            return (
+                top
+                + (max_y - v)
+                / (max_y - min_y)
+                * plot_height
+            )
+
+        colors = [
+            "#38bdf8",
+            "#34d399",
+            "#fbbf24",
+            "#c084fc",
+        ]
+
+        svg_parts = []
+
+        # Y-axis grid
+        for i in range(5):
+
+            value = min_y + (max_y - min_y) * i / 4
+            y = sy(value)
+
+            svg_parts.append(
+                f'<line x1="{left}" y1="{y:.2f}" '
+                f'x2="{width-right}" y2="{y:.2f}" '
+                'stroke="#334155" stroke-width="1" '
+                'stroke-dasharray="4 5"/>'
+            )
+
+            svg_parts.append(
+                f'<text x="{left-12}" y="{y+4:.2f}" '
+                'text-anchor="end" '
+                'fill="#cbd5e1" font-size="14">'
+                f'{value:.2f}</text>'
+            )
+
+        tw_tz = timezone(timedelta(hours=8))
+
+        # X-axis labels
+        for i in range(5):
+
+            t = min_x + (max_x - min_x) * i / 4
+            x = sx(t)
+
+            label = datetime.fromtimestamp(
+                t,
+                tz=tw_tz,
+            ).strftime("%H:%M")
+
+            svg_parts.append(
+                f'<text x="{x:.2f}" y="{height-30}" '
+                'text-anchor="middle" '
+                'fill="#cbd5e1" font-size="14">'
+                f'{label}</text>'
+            )
+
+        # Data series
+        for idx, s in enumerate(series):
+
+            color = colors[idx]
+
+            coords = " ".join(
+                f"{sx(t):.2f},{sy(v):.2f}"
+                for t, v in s["points"]
+            )
+
+            svg_parts.append(
+                f'<polyline points="{coords}" '
+                'fill="none" '
+                f'stroke="{color}" '
+                'stroke-width="2.6" '
+                'stroke-linecap="round" '
+                'stroke-linejoin="round"/>'
+            )
+
+        # Legend
+        legend_items = []
+
+        for idx, s in enumerate(series):
+
+            color = colors[idx]
+            name = html.escape(s["name"])
+
+            legend_items.append(
+                '<div class="legend-item">'
+                f'<span class="dot" style="background:{color}"></span>'
+                f'<span>{name}</span>'
+                '</div>'
+            )
+
+        query = html.escape(
+            str(params.get("query") or "")
         )
 
-        return text.strip()
+        description = html.escape(
+            str(
+                params.get("description")
+                or "Prometheus Trend"
+            )
+        )
+
+        unit_safe = html.escape(unit)
+
+        total_points = sum(
+            len(s["points"]) for s in series
+        )
+
+        svg = "".join(svg_parts)
+        legends = "".join(legend_items)
+
+        return f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+* {{ box-sizing:border-box; }}
+html,body {{
+    margin:0;
+    padding:0;
+    width:100%;
+    overflow:hidden;
+    background:transparent;
+    color:#e2e8f0;
+    font-family:system-ui,sans-serif;
+}}
+.card {{
+    background:#0f172a;
+    border:1px solid #334155;
+    border-radius:12px;
+    padding:16px;
+    width:100%;
+}}
+.title {{
+    font-weight:600;
+    font-size:16px;
+    margin-bottom:5px;
+    overflow-wrap:anywhere;
+}}
+.subtitle {{
+    color:#94a3b8;
+    font-size:12px;
+    margin-bottom:12px;
+}}
+svg {{
+    display:block;
+    width:100%;
+    height:auto;
+}}
+.legend {{
+    display:flex;
+    flex-wrap:wrap;
+    gap:12px;
+    margin-top:10px;
+}}
+.legend-item {{
+    display:flex;
+    align-items:center;
+    gap:6px;
+    font-size:12px;
+    overflow-wrap:anywhere;
+}}
+.dot {{
+    width:10px;
+    height:10px;
+    border-radius:50%;
+    flex-shrink:0;
+}}
+.details {{
+    margin-top:12px;
+    font-size:12px;
+    color:#94a3b8;
+}}
+code {{
+    white-space:pre-wrap;
+    overflow-wrap:anywhere;
+    color:#cbd5e1;
+}}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="title">{description}</div>
+  <div class="subtitle">
+    單位：{unit_safe} · 台灣時間 UTC+8 · {total_points} 個資料點
+  </div>
+  <svg viewBox="0 0 {width} {height}"
+       xmlns="http://www.w3.org/2000/svg"
+       role="img"
+       aria-label="{description}">
+    {svg}
+  </svg>
+  <div class="legend">{legends}</div>
+  <details class="details">
+    <summary>查看 PromQL</summary>
+    <code>{query}</code>
+  </details>
+</div>
+<script>
+(function() {{
+    function reportHeight() {{
+        var h = Math.ceil(
+            document.documentElement.scrollHeight
+        );
+        parent.postMessage(
+            {{type:"iframe:height",height:h}},
+            "*"
+        );
+    }}
+    window.addEventListener("load", reportHeight);
+    window.addEventListener("resize", reportHeight);
+    if (typeof ResizeObserver !== "undefined") {{
+        new ResizeObserver(reportHeight).observe(
+            document.body
+        );
+    }}
+    reportHeight();
+}})();
+</script>
+</body>
+</html>"""
 
     # =========================================================
-    # Grafana parameter validation
+    # Grafana
     # =========================================================
 
     @staticmethod
@@ -133,62 +482,40 @@ class Pipe:
 
         return fallback
 
-    def build_render_request(self, job):
+    def grafana_request(self, job):
 
-        params = job.get("params") or {}
-        tool = job.get("tool")
+        params = job["params"]
+        tool = job["tool"]
 
         uid = str(
             params.get("dashboard_uid") or ""
-        ).strip()
+        )
 
-        if not re.fullmatch(
-            r"[A-Za-z0-9_-]{1,80}",
-            uid,
-        ):
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", uid):
             raise ValueError("Invalid Dashboard UID")
 
         if tool == "grafana_render_panel":
 
-            panel_id = int(
-                params.get("panel_id") or 0
-            )
+            panel_id = int(params.get("panel_id") or 0)
 
             if not 1 <= panel_id <= 100000:
-                raise ValueError("Invalid Panel ID")
+                raise ValueError("Invalid panel_id")
 
-            path = (
-                "render/d-solo/"
-                + quote(uid, safe="")
-                + "/_"
-            )
-
+            path = f"render/d-solo/{quote(uid, safe='')}/_"
             title = f"Grafana Panel {panel_id}"
 
-        elif tool == "grafana_render_dashboard":
-
-            panel_id = None
-
-            path = (
-                "render/d/"
-                + quote(uid, safe="")
-                + "/_"
-            )
-
-            title = "Grafana Dashboard"
-
         else:
-            raise ValueError("Unsupported render tool")
+            panel_id = None
+            path = f"render/d/{quote(uid, safe='')}/_"
+            title = "Grafana Dashboard"
 
         query = {
             "orgId": self.valves.GRAFANA_ORG_ID,
             "from": self.safe_time(
-                params.get("from_time"),
-                "now-1h",
+                params.get("from_time"), "now-1h"
             ),
             "to": self.safe_time(
-                params.get("to_time"),
-                "now",
+                params.get("to_time"), "now"
             ),
             "width": min(
                 max(int(params.get("width") or 1000), 400),
@@ -208,22 +535,10 @@ class Pipe:
         if panel_id is not None:
             query["panelId"] = panel_id
 
-        timezone = str(
-            params.get("timezone") or ""
-        )
+        tz = str(params.get("timezone") or "")
 
-        if re.fullmatch(
-            r"[A-Za-z0-9_+./-]{1,64}",
-            timezone,
-        ):
-            query["tz"] = timezone
-
-        # Grafana template variables
-        #
-        # variables:
-        # var-cluster=k8skf;
-        # var-node=UTCKFK8SINF02;
-        # var-instance=10.26.166.232:9100
+        if re.fullmatch(r"[A-Za-z0-9_+./-]{1,64}", tz):
+            query["tz"] = tz
 
         variables = params.get("variables")
 
@@ -234,107 +549,60 @@ class Pipe:
                 if "=" not in pair:
                     continue
 
-                key, value = [
+                key, val = (
                     x.strip()
                     for x in pair.split("=", 1)
-                ]
+                )
 
-                if not re.fullmatch(
-                    r"var-[A-Za-z0-9_-]{1,64}",
-                    key,
+                if re.fullmatch(
+                    r"var-[A-Za-z0-9_-]{1,64}", key
+                ) and re.fullmatch(
+                    r"[A-Za-z0-9_.:/ -]{1,128}", val
                 ):
-                    continue
-
-                if not re.fullmatch(
-                    r"[A-Za-z0-9_.:/ -]{1,128}",
-                    value,
-                ):
-                    continue
-
-                query[key] = value
+                    query[key] = val
 
         return title, path, query
 
-    # =========================================================
-    # Auto-resizing Grafana image embed
-    # =========================================================
-
     @staticmethod
-    def make_image_embed(title, image_b64):
+    def grafana_html(title, image_b64):
 
         safe_title = html.escape(title, quote=True)
 
-        # Open WebUI Rich UI iframe:
-        # Report the actual HTML content height to the parent.
-        # This avoids a fixed-height iframe scrollbar.
-
         return (
-            '<!doctype html>'
-            '<html>'
-            '<head>'
+            '<!doctype html><html><head>'
             '<meta charset="utf-8">'
             '<meta name="viewport" '
             'content="width=device-width,initial-scale=1">'
             '<style>'
-            '*{box-sizing:border-box;}'
-            'html,body{'
-            'margin:0;'
-            'padding:0;'
-            'width:100%;'
-            'overflow:hidden;'
-            'background:transparent;'
-            'font-family:system-ui,sans-serif;'
-            '}'
-            '.grafana-wrap{'
-            'width:100%;'
-            'margin:0;'
-            'padding:0;'
-            '}'
-            '.grafana-image{'
-            'display:block;'
-            'width:100%;'
-            'max-width:100%;'
-            'height:auto;'
-            'object-fit:contain;'
-            'border-radius:8px;'
-            '}'
-            '</style>'
-            '</head>'
-            '<body>'
-            '<div class="grafana-wrap">'
-            f'<img id="grafana-image" class="grafana-image" '
-            f'alt="{safe_title}" '
+            '*{box-sizing:border-box}'
+            'html,body{margin:0;padding:0;'
+            'width:100%;overflow:hidden;'
+            'background:transparent}'
+            'img{display:block;width:100%;'
+            'height:auto;max-width:100%}'
+            '</style></head><body>'
+            f'<img id="grafana" alt="{safe_title}" '
             f'src="data:image/png;base64,{image_b64}">'
-            '</div>'
             '<script>'
             '(function(){'
-            'function reportHeight(){'
-            'var h=Math.ceil('
+            'function resize(){'
+            'parent.postMessage({type:"iframe:height",'
+            'height:Math.ceil('
             'document.documentElement.scrollHeight'
-            ');'
-            'parent.postMessage('
-            '{type:"iframe:height",height:h},"*");'
-            '}'
-            'window.addEventListener("load",reportHeight);'
-            'window.addEventListener("resize",reportHeight);'
-            'var img=document.getElementById("grafana-image");'
-            'if(img){'
-            'img.addEventListener("load",reportHeight);'
-            '}'
-            'if(typeof ResizeObserver!=="undefined"){'
-            'new ResizeObserver(reportHeight).observe('
-            'document.body'
-            ');'
-            '}'
-            'reportHeight();'
+            ')},"*")}'
+            'window.addEventListener("load",resize);'
+            'window.addEventListener("resize",resize);'
+            'var img=document.getElementById("grafana");'
+            'if(img)img.addEventListener("load",resize);'
+            'if(typeof ResizeObserver!=="undefined")'
+            'new ResizeObserver(resize).observe(document.body);'
+            'resize()'
             '})();'
-            '</script>'
-            '</body>'
-            '</html>'
+            '</script></body></html>'
         )
 
     # =========================================================
-    # Main Pipe
+    # Main
     # =========================================================
 
     async def pipe(
@@ -345,13 +613,10 @@ class Pipe:
         __task__=None,
     ):
 
-        # Admin-only while using the shared
-        # HolmesGPT ServiceAccount and Grafana Viewer token.
+        # Keep original admin-only restriction.
 
         if not __user__ or __user__.get("role") != "admin":
             return "Access denied: administrator access required."
-
-        # Open WebUI title/tag/metadata tasks
 
         if __task__:
             return "HolmesGPT SRE"
@@ -359,19 +624,22 @@ class Pipe:
         messages = body.get("messages", [])
 
         questions = [
-            m.get("content")
+            m["content"]
             for m in messages
             if m.get("role") == "user"
             and isinstance(m.get("content"), str)
         ]
 
-        if not questions or not questions[-1].strip():
+        if not questions:
             return "請輸入 Kubernetes 維運問題。"
 
         question = questions[-1].strip()
 
+        if not question:
+            return "請輸入 Kubernetes 維運問題。"
+
         system_prompt = "\n\n".join(
-            m.get("content", "")
+            m["content"]
             for m in messages
             if m.get("role") == "system"
             and isinstance(m.get("content"), str)
@@ -401,40 +669,30 @@ class Pipe:
         tool_history = []
         tool_params_by_id = {}
 
-        render_jobs = []
-        render_keys = set()
+        grafana_jobs = []
+        prometheus_jobs = {}
+
+        seen_grafana = set()
 
         final_answer = None
         pending_event = ""
         pending_data = []
-        completed = False
-
-        # -----------------------------------------------------
-        # Open WebUI status
-        # -----------------------------------------------------
 
         async def status(message, done=False):
 
             if __event_emitter__:
-
-                await __event_emitter__(
-                    {
-                        "type": "status",
-                        "data": {
-                            "description": message,
-                            "done": done,
-                            "hidden": False,
-                        },
-                    }
-                )
-
-        # -----------------------------------------------------
-        # Tool event handling
-        # -----------------------------------------------------
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {
+                        "description": message,
+                        "done": done,
+                        "hidden": False,
+                    },
+                })
 
         async def handle_event(event_type, data):
 
-            nonlocal final_answer, completed
+            nonlocal final_answer
 
             if event_type == "start_tool_calling":
 
@@ -458,14 +716,12 @@ class Pipe:
                 if call_id and isinstance(params, dict):
                     tool_params_by_id[call_id] = params
 
-                tool_history.append(
-                    {
-                        "tool": tool,
-                        "status": "running",
-                        "id": call_id,
-                        "message": "執行中",
-                    }
-                )
+                tool_history.append({
+                    "tool": tool,
+                    "status": "running",
+                    "id": call_id,
+                    "message": "執行中",
+                })
 
                 await status(f"正在執行 {tool}...")
 
@@ -477,19 +733,15 @@ class Pipe:
                     or "unknown"
                 )
 
-                result = data.get("result") or {}
-
-                if not isinstance(result, dict):
-                    result = {}
-
-                outcome = str(
-                    result.get("status") or "unknown"
-                ).lower()
-
                 call_id = (
                     data.get("tool_call_id")
                     or data.get("id")
                 )
+
+                result = data.get("result") or {}
+
+                if not isinstance(result, dict):
+                    result = {}
 
                 params = (
                     result.get("params")
@@ -501,81 +753,112 @@ class Pipe:
                 if not isinstance(params, dict):
                     params = {}
 
+                outcome = str(
+                    result.get("status") or "unknown"
+                ).lower()
+
+                error = result.get("error")
+
+                # Some HolmesGPT Kubernetes tools place
+                # subprocess errors inside data.stderr
+                # even when status is "success".
+
+                stderr = ""
+
+                raw_data = result.get("data")
+
+                if isinstance(raw_data, dict):
+                    stderr = str(
+                        raw_data.get("stderr") or ""
+                    )
+
+                elif isinstance(raw_data, str):
+
+                    try:
+                        parsed = json.loads(raw_data)
+
+                        if isinstance(parsed, dict):
+                            stderr = str(
+                                parsed.get("stderr") or ""
+                            )
+                    except json.JSONDecodeError:
+                        pass
+
+                if re.search(
+                    r"runtime: out of memory|"
+                    r"fatal error: out of memory|"
+                    r"Unable to find resource kind",
+                    stderr,
+                    flags=re.IGNORECASE,
+                ):
+                    outcome = "error"
+                    error = stderr.splitlines()[0]
+
                 if outcome == "success":
-
-                    if tool in {
-                        "grafana_render_panel",
-                        "grafana_render_dashboard",
-                    }:
-                        message = "Grafana 圖片渲染成功"
-
-                    elif tool == "fetch_skill":
-                        message = "已載入調查 Skill"
-
-                    elif tool.startswith("kubernetes"):
-                        message = "Kubernetes 資源查詢完成"
-
-                    elif (
-                        tool.startswith("grafana")
-                        or "prometheus" in tool
-                        or tool in {
-                            "list_datasources",
-                            "get_metric_names",
-                            "get_label_values",
-                        }
-                    ):
-                        message = "監控指標查詢完成"
-
-                    else:
-                        message = f"{tool} 執行完成"
-
+                    message = f"{tool} 查詢完成"
                 else:
-
-                    error = str(
-                        result.get("error")
-                        or "工具執行未成功"
-                    )[:140]
-
-                    message = f"{tool} 失敗：{error}"
+                    message = (
+                        f"{tool} 失敗："
+                        f"{str(error or stderr or 'unknown')[:150]}"
+                    )
 
                 matched = False
 
                 for item in reversed(tool_history):
 
-                    same_id = (
-                        bool(call_id)
-                        and item["id"] == call_id
-                    )
+                    if item["status"] != "running":
+                        continue
 
-                    same_tool = (
-                        item["tool"] == tool
-                    )
-
-                    if item["status"] == "running" and (
-                        same_id or same_tool
+                    if (
+                        (call_id and item["id"] == call_id)
+                        or item["tool"] == tool
                     ):
 
                         item.update(
                             status=outcome,
                             message=message,
                         )
-
                         matched = True
                         break
 
                 if not matched:
+                    tool_history.append({
+                        "tool": tool,
+                        "status": outcome,
+                        "id": call_id,
+                        "message": message,
+                    })
 
-                    tool_history.append(
-                        {
-                            "tool": tool,
-                            "status": outcome,
-                            "id": call_id,
-                            "message": message,
-                        }
+                # ---------------------------------------------
+                # Prometheus range query:
+                # Store only validated matrix data.
+                # ---------------------------------------------
+
+                if (
+                    self.valves.SHOW_PROMETHEUS_CHARTS
+                    and outcome == "success"
+                    and tool == "execute_prometheus_range_query"
+                    and call_id
+                ):
+
+                    matrix = self.decode_prometheus_result(
+                        result
                     )
 
-                # Only render images from successful
-                # known Grafana tools.
+                    if (
+                        matrix
+                        and len(prometheus_jobs)
+                        < self.valves.MAX_CHARTS
+                    ):
+
+                        prometheus_jobs[call_id] = {
+                            "params": dict(params),
+                            "matrix": matrix,
+                        }
+
+                # ---------------------------------------------
+                # Grafana rendering jobs
+                # ---------------------------------------------
 
                 if (
                     self.valves.SHOW_RENDERED_IMAGES
@@ -596,19 +879,15 @@ class Pipe:
                     )
 
                     if (
-                        key not in render_keys
-                        and len(render_jobs)
+                        key not in seen_grafana
+                        and len(grafana_jobs)
                         < self.valves.MAX_IMAGES
                     ):
-
-                        render_keys.add(key)
-
-                        render_jobs.append(
-                            {
-                                "tool": tool,
-                                "params": dict(params),
-                            }
-                        )
+                        seen_grafana.add(key)
+                        grafana_jobs.append({
+                            "tool": tool,
+                            "params": dict(params),
+                        })
 
                 await status(message)
 
@@ -625,29 +904,18 @@ class Pipe:
                     or ""
                 )
 
-                completed = True
-
                 await status("分析完成")
-
-            elif event_type == "approval_required":
-
-                await status("部分操作需要額外核准")
 
             elif event_type == "error":
 
-                error = (
-                    data.get("message")
-                    or data.get("error")
-                    or "Unknown error"
-                )
-
                 await status(
-                    "調查失敗：" + str(error)[:140]
+                    "HolmesGPT 回傳錯誤："
+                    + str(
+                        data.get("message")
+                        or data.get("error")
+                        or "unknown"
+                    )[:140]
                 )
-
-        # -----------------------------------------------------
-        # Parse SSE
-        # -----------------------------------------------------
 
         async def process_sse():
 
@@ -674,10 +942,6 @@ class Pipe:
             if isinstance(data, dict):
                 await handle_event(event_type, data)
 
-        # =====================================================
-        # Call HolmesGPT
-        # =====================================================
-
         try:
 
             await status("HolmesGPT 正在開始調查")
@@ -695,8 +959,8 @@ class Pipe:
                 async with client.stream(
                     "POST",
                     holmes_url,
-                    json=payload,
                     headers=headers,
+                    json=payload,
                 ) as response:
 
                     response.raise_for_status()
@@ -720,33 +984,190 @@ class Pipe:
 
                     await process_sse()
 
-            if not completed:
-                await status("調查串流已結束")
-
             if not final_answer:
 
                 await status(
-                    "HolmesGPT 沒有回傳完整回答",
+                    "HolmesGPT 未回傳最終回答",
                     done=True,
                 )
 
-                return (
-                    "HolmesGPT 沒有回傳完整調查結論。"
-                    "請檢查 HolmesGPT Logs。"
-                )
-
-            # -------------------------------------------------
-            # Remove invalid tool-image:// markdown
-            # -------------------------------------------------
+                return "HolmesGPT 未回傳完整調查結果。"
 
             output = str(final_answer)
 
             if self.valves.REMOVE_TOOL_IMAGE_REFERENCES:
-                output = self.clean_tool_images(output)
+                output = self.clean_images(output)
 
-            # -------------------------------------------------
+            # =================================================
+            # Render PromQL markers
+            # =================================================
+
+            promql_pattern = re.compile(
+                r"<<\s*(\{.*?\})\s*>>",
+                flags=re.DOTALL,
+            )
+
+            referenced_ids = []
+
+            def replace_promql_marker(match):
+
+                try:
+                    marker = json.loads(match.group(1))
+                except json.JSONDecodeError:
+                    return match.group(0)
+
+                if marker.get("type") != "promql":
+                    return match.group(0)
+
+                call_id = marker.get("tool_call_id")
+
+                if call_id in prometheus_jobs:
+                    referenced_ids.append(call_id)
+                    return "（Prometheus 趨勢圖附於下方）"
+
+                return (
+                    "（未取得可繪製的 Prometheus "
+                    "時間序列資料）"
+                )
+
+            output = promql_pattern.sub(
+                replace_promql_marker,
+                output,
+            )
+
+            # =================================================
+            # Emit Prometheus chart embeds
+            # =================================================
+
+            shown_charts = 0
+
+            if (
+                self.valves.SHOW_PROMETHEUS_CHARTS
+                and __event_emitter__
+            ):
+
+                chart_ids = list(dict.fromkeys(
+                    referenced_ids
+                    + list(prometheus_jobs.keys())
+                ))
+
+                for call_id in chart_ids[
+                    :self.valves.MAX_CHARTS
+                ]:
+
+                    job = prometheus_jobs.get(call_id)
+
+                    if not job:
+                        continue
+
+                    chart = self.chart_html(job)
+
+                    if not chart:
+                        continue
+
+                    await __event_emitter__({
+                        "type": "embeds",
+                        "data": {
+                            "embeds": [chart],
+                        },
+                    })
+
+                    shown_charts += 1
+
+            # =================================================
+            # Render Grafana PNG
+            # =================================================
+
+            shown_grafana = 0
+
+            if (
+                grafana_jobs
+                and __event_emitter__
+                and self.valves.GRAFANA_TOKEN
+            ):
+
+                grafana_headers = {
+                    "Authorization": (
+                        "Bearer " + self.valves.GRAFANA_TOKEN
+                    ),
+                    "X-Grafana-Org-Id": str(
+                        self.valves.GRAFANA_ORG_ID
+                    ),
+                    "Accept": "image/png",
+                }
+
+                async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(
+                        90.0,
+                        connect=10.0,
+                    ),
+                    follow_redirects=False,
+                ) as grafana_client:
+
+                    for job in grafana_jobs:
+
+                        try:
+
+                            title, path, query = (
+                                self.grafana_request(job)
+                            )
+
+                            url = (
+                                self.valves.GRAFANA_URL.rstrip("/")
+                                + "/"
+                                + path
+                            )
+
+                            response = await grafana_client.get(
+                                url,
+                                params=query,
+                                headers=grafana_headers,
+                            )
+
+                            response.raise_for_status()
+
+                            png = response.content
+
+                            if not png.startswith(
+                                b"\x89PNG\r\n\x1a\n"
+                            ):
+                                raise ValueError("Invalid PNG")
+
+                            if (
+                                len(png)
+                                > self.valves.MAX_IMAGE_BYTES
+                            ):
+                                raise ValueError("PNG too large")
+
+                            image_b64 = base64.b64encode(
+                                png
+                            ).decode("ascii")
+
+                            embed = self.grafana_html(
+                                title,
+                                image_b64,
+                            )
+
+                            await __event_emitter__({
+                                "type": "embeds",
+                                "data": {
+                                    "embeds": [embed],
+                                },
+                            })
+
+                            shown_grafana += 1
+
+                        except (
+                            httpx.HTTPError,
+                            ValueError,
+                            TypeError,
+                            OverflowError,
+                        ):
+                            continue
+
+            # =================================================
             # Tool history
-            # -------------------------------------------------
+            # =================================================
 
             if self.valves.SHOW_TOOL_HISTORY and tool_history:
 
@@ -756,164 +1177,35 @@ class Pipe:
                     "### 工具執行紀錄",
                 ]
 
-                for i, item in enumerate(tool_history[:30], 1):
+                for i, item in enumerate(
+                    tool_history[:30], 1
+                ):
 
-                    mark = (
+                    symbol = (
                         "✓"
                         if item["status"] == "success"
                         else "!"
                     )
 
                     lines.append(
-                        f"{i}. {mark} "
+                        f"{i}. {symbol} "
                         f"`{item['tool']}` — "
-                        f"{item.get('message', item['status'])}"
-                    )
-
-                if len(tool_history) > 30:
-                    lines.append(
-                        f"另有 {len(tool_history) - 30} 次工具呼叫"
+                        f"{item['message']}"
                     )
 
                 output += "\n".join(lines)
 
-            # =================================================
-            # Render Grafana images
-            # =================================================
+            if shown_charts:
+                output += (
+                    f"\n\n已附上 {shown_charts} 張 "
+                    "Prometheus 趨勢圖。"
+                )
 
-            if render_jobs and __event_emitter__:
-
-                if not self.valves.GRAFANA_TOKEN:
-
-                    output += (
-                        "\n\n> 未設定 GRAFANA_TOKEN，"
-                        "因此沒有顯示 Grafana 圖片。"
-                    )
-
-                else:
-
-                    shown = 0
-                    failures = []
-
-                    grafana_headers = {
-                        "Authorization": (
-                            "Bearer "
-                            + self.valves.GRAFANA_TOKEN
-                        ),
-                        "X-Grafana-Org-Id": str(
-                            self.valves.GRAFANA_ORG_ID
-                        ),
-                        "Accept": "image/png",
-                    }
-
-                    async with httpx.AsyncClient(
-                        timeout=httpx.Timeout(
-                            90.0,
-                            connect=10.0,
-                        ),
-                        follow_redirects=False,
-                    ) as grafana_client:
-
-                        for job in render_jobs:
-
-                            try:
-
-                                title, path, query = (
-                                    self.build_render_request(job)
-                                )
-
-                                url = (
-                                    self.valves.GRAFANA_URL.rstrip("/")
-                                    + "/"
-                                    + path
-                                )
-
-                                response = (
-                                    await grafana_client.get(
-                                        url,
-                                        params=query,
-                                        headers=grafana_headers,
-                                    )
-                                )
-
-                                response.raise_for_status()
-
-                                content_type = (
-                                    response.headers.get(
-                                        "Content-Type", ""
-                                    )
-                                    .split(";")[0]
-                                    .strip()
-                                    .lower()
-                                )
-
-                                if content_type != "image/png":
-                                    raise ValueError(
-                                        "Grafana did not return image/png"
-                                    )
-
-                                png = response.content
-
-                                if not png.startswith(
-                                    b"\x89PNG\r\n\x1a\n"
-                                ):
-                                    raise ValueError(
-                                        "Invalid PNG signature"
-                                    )
-
-                                if len(png) > self.valves.MAX_IMAGE_BYTES:
-                                    raise ValueError(
-                                        "PNG exceeds size limit"
-                                    )
-
-                                image_b64 = (
-                                    base64.b64encode(png)
-                                    .decode("ascii")
-                                )
-
-                                embed_html = self.make_image_embed(
-                                    title,
-                                    image_b64,
-                                )
-
-                                await __event_emitter__(
-                                    {
-                                        "type": "embeds",
-                                        "data": {
-                                            "embeds": [embed_html],
-                                        },
-                                    }
-                                )
-
-                                shown += 1
-
-                            except (
-                                httpx.HTTPError,
-                                ValueError,
-                                TypeError,
-                                OverflowError,
-                            ) as exc:
-
-                                failures.append(
-                                    f"{job['tool']}: "
-                                    f"{type(exc).__name__}"
-                                )
-
-                    if shown:
-                        output += (
-                            f"\n\n已附上 {shown} 張 "
-                            "Grafana 圖片。"
-                        )
-
-                    if failures:
-                        output += (
-                            "\n\n> 部分圖片顯示失敗："
-                            + "、".join(failures)
-                        )
-
-            # -------------------------------------------------
-            # Complete
-            # -------------------------------------------------
+            if shown_grafana:
+                output += (
+                    f"\n\n已附上 {shown_grafana} 張 "
+                    "Grafana 渲染圖片。"
+                )
 
             await status(
                 "Kubernetes 調查完成",
@@ -924,44 +1216,25 @@ class Pipe:
 
         except httpx.TimeoutException:
 
-            await status(
-                "HolmesGPT 調查逾時",
-                done=True,
-            )
-
-            return "HolmesGPT 調查逾時，請檢查 Logs。"
+            await status("HolmesGPT 調查逾時", done=True)
+            return "HolmesGPT 調查逾時。"
 
         except httpx.HTTPStatusError as exc:
 
-            await status(
-                "HolmesGPT HTTP 請求失敗",
-                done=True,
-            )
-
+            await status("HolmesGPT API 錯誤", done=True)
             return (
-                "HolmesGPT API HTTP 錯誤："
+                "HolmesGPT HTTP 錯誤："
                 + str(exc.response.status_code)
             )
 
         except httpx.RequestError:
 
-            await status(
-                "HolmesGPT 連線失敗",
-                done=True,
-            )
-
-            return (
-                "無法連線 HolmesGPT，"
-                "請檢查 Service、DNS 與 NetworkPolicy。"
-            )
+            await status("HolmesGPT 連線失敗", done=True)
+            return "無法連線 HolmesGPT API。"
 
         except Exception as exc:
 
-            await status(
-                "HolmesGPT Pipe 執行失敗",
-                done=True,
-            )
-
+            await status("Pipe 執行失敗", done=True)
             return (
                 "Pipe 處理錯誤："
                 + type(exc).__name__
