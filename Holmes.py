@@ -1,8 +1,8 @@
 
 """
-title: HolmesGPT SRE
-description: Kubernetes SRE Agent with Grafana PNG and Prometheus trend charts
-version: 5.0.0
+title: HolmesGPT SRE Interactive
+description: HolmesGPT Kubernetes SRE with interactive Prometheus charts and Grafana rendering
+version: 5.1.0
 """
 
 import base64
@@ -11,7 +11,7 @@ import json
 import math
 import re
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from urllib.parse import quote
 
 import httpx
@@ -23,22 +23,54 @@ class Pipe:
     class Valves(BaseModel):
 
         HOLMES_URL: str = Field(
-            default="http://holmesgpt-holmes.holmesgpt.svc.cluster.local:80"
+            default="http://holmesgpt-holmes.holmesgpt.svc.cluster.local:80",
+            description="HolmesGPT internal API URL",
         )
 
-        MODEL: str = Field(default="gemma-local")
+        MODEL: str = Field(
+            default="gemma-local",
+        )
 
         API_KEY: str = Field(
             default="",
+            description="Optional HolmesGPT API key",
             json_schema_extra={"input": {"type": "password"}},
         )
 
-        TIMEOUT: int = Field(default=300)
+        TIMEOUT: int = Field(
+            default=300,
+            ge=30,
+            le=900,
+        )
 
         SHOW_TOOL_HISTORY: bool = Field(default=True)
 
+        SHOW_PROMETHEUS_CHARTS: bool = Field(default=True)
+
+        SHOW_RENDERED_IMAGES: bool = Field(default=True)
+
+        REMOVE_TOOL_IMAGE_REFERENCES: bool = Field(default=True)
+
+        MAX_CHARTS: int = Field(
+            default=3,
+            ge=1,
+            le=5,
+        )
+
+        MAX_SERIES: int = Field(
+            default=12,
+            ge=1,
+            le=20,
+        )
+
+        MAX_POINTS_PER_SERIES: int = Field(
+            default=240,
+            ge=20,
+            le=500,
+        )
+
         GRAFANA_URL: str = Field(
-            default="http://grafana.monitoring.svc.cluster.local:80"
+            default="http://grafana.monitoring.svc.cluster.local:80",
         )
 
         GRAFANA_TOKEN: str = Field(
@@ -48,54 +80,120 @@ class Pipe:
 
         GRAFANA_ORG_ID: int = Field(default=1)
 
-        SHOW_RENDERED_IMAGES: bool = Field(default=True)
+        MAX_IMAGES: int = Field(
+            default=2,
+            ge=1,
+            le=4,
+        )
 
-        SHOW_PROMETHEUS_CHARTS: bool = Field(default=True)
-
-        MAX_IMAGES: int = Field(default=2, ge=1, le=4)
-
-        MAX_CHARTS: int = Field(default=3, ge=1, le=5)
-
-        MAX_IMAGE_BYTES: int = Field(default=1500000)
-
-        REMOVE_TOOL_IMAGE_REFERENCES: bool = Field(
-            default=True
+        MAX_IMAGE_BYTES: int = Field(
+            default=1500000,
         )
 
     def __init__(self):
-        self.name = "HolmesGPT SRE"
+        self.name = "HolmesGPT SRE Interactive"
         self.valves = self.Valves()
 
     # =========================================================
-    # Helpers
+    # General utilities
     # =========================================================
 
     @staticmethod
-    def clean_images(text):
+    def remove_tool_image_refs(value):
 
-        text = str(text or "")
+        text = str(value or "")
 
-        return re.sub(
+        text = re.sub(
             r"!\[([^\]]*)\]\(\s*tool-image://[^)\s]+\s*\)",
-            lambda m: f"\n\n*{m.group(1)}*\n\n",
+            lambda match: (
+                "\n\n*" + match.group(1) + "*\n\n"
+                if match.group(1).strip()
+                else ""
+            ),
             text,
             flags=re.IGNORECASE,
-        ).strip()
+        )
+
+        text = re.sub(
+            r"tool-image://[A-Za-z0-9_.:/-]+",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+
+        return text.strip()
 
     @staticmethod
-    def decode_prometheus_result(result):
+    def parse_object(value):
+
+        if isinstance(value, dict):
+            return value
+
+        if isinstance(value, str):
+            try:
+                result = json.loads(value)
+                if isinstance(result, dict):
+                    return result
+            except (ValueError, TypeError):
+                pass
+
+        return {}
+
+    @staticmethod
+    def parse_timestamp(value):
+
+        if isinstance(value, (int, float)):
+            number = float(value)
+            if number > 1e11:
+                number /= 1000
+            return number
+
+        if not value:
+            return None
+
+        try:
+            value = str(value).strip()
+
+            if value.isdigit():
+                return Pipe.parse_timestamp(float(value))
+
+            return datetime.fromisoformat(
+                value.replace("Z", "+00:00")
+            ).timestamp()
+
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    @staticmethod
+    def compact_points(points, maximum):
+
+        if len(points) <= maximum:
+            return points
+
+        # Preserve first and last points with even sampling.
+        # This is visualization downsampling, not aggregation.
+        indexes = [
+            round(i * (len(points) - 1) / (maximum - 1))
+            for i in range(maximum)
+        ]
+
+        return [points[i] for i in sorted(set(indexes))]
+
+    # =========================================================
+    # Prometheus result parsing
+    # =========================================================
+
+    @staticmethod
+    def decode_prometheus_matrix(result):
 
         data = result.get("data")
 
-        # HolmesGPT 0.46.0 returns Prometheus output
-        # as a JSON-encoded string.
-
-        for _ in range(3):
+        for _ in range(4):
 
             if isinstance(data, str):
                 try:
                     data = json.loads(data)
-                except json.JSONDecodeError:
+                except (ValueError, TypeError):
                     return None
 
             if not isinstance(data, dict):
@@ -107,372 +205,922 @@ class Pipe:
             ):
                 return None
 
-            if isinstance(data.get("data"), dict):
-                data = data["data"]
+            if data.get("resultType") == "matrix":
+                values = data.get("result")
+                if isinstance(values, list):
+                    return data
+
+            data = data.get("data")
+
+        return None
+
+    @staticmethod
+    def determine_unit(params, raw_max):
+
+        output_type = str(
+            params.get("output_type") or ""
+        ).lower()
+
+        query = str(
+            params.get("query") or ""
+        ).lower()
+
+        description = str(
+            params.get("description") or ""
+        ).lower()
+
+        if (
+            "memory" in output_type
+            or "byte" in output_type
+            or "memory" in query
+            or "bytes" in query
+        ):
+
+            if raw_max >= 1024 ** 3:
+                return "GiB", float(1024 ** 3)
+
+            return "MiB", float(1024 ** 2)
+
+        if (
+            "cpu" in output_type
+            or "cpu" in query
+            or "cpu" in description
+        ):
+            return "CPU cores", 1.0
+
+        if (
+            "percent" in output_type
+            or "percentage" in output_type
+        ):
+            return "%", 1.0
+
+        return "Value", 1.0
+
+    @staticmethod
+    def metric_name(metric, index):
+
+        for key in (
+            "pod",
+            "container",
+            "namespace",
+            "instance",
+            "job",
+            "__name__",
+        ):
+            if metric.get(key):
+                return str(metric[key])
+
+        labels = [
+            f"{k}={v}"
+            for k, v in sorted(metric.items())
+            if k != "__name__"
+        ]
+
+        if labels:
+            return ", ".join(labels)[:160]
+
+        return f"Series {index + 1}"
+
+    def make_chart_data(self, job, question):
+
+        matrix = job.get("matrix") or {}
+        params = job.get("params") or {}
+
+        start = self.parse_timestamp(
+            params.get("start")
+        )
+
+        end = self.parse_timestamp(
+            params.get("end")
+        )
+
+        if (
+            start is not None
+            and end is not None
+            and start >= end
+        ):
+            return None
+
+        parsed_series = []
+        raw_max = 0.0
+
+        for index, entry in enumerate(
+            matrix.get("result", [])[:self.valves.MAX_SERIES]
+        ):
+
+            if not isinstance(entry, dict):
                 continue
 
-            break
+            metric = entry.get("metric") or {}
 
-        if not isinstance(data, dict):
+            if not isinstance(metric, dict):
+                metric = {}
+
+            original_points = []
+
+            for pair in entry.get("values", []):
+
+                if (
+                    not isinstance(pair, (list, tuple))
+                    or len(pair) < 2
+                ):
+                    continue
+
+                try:
+                    t = float(pair[0])
+                    v = float(pair[1])
+
+                    if not (
+                        math.isfinite(t)
+                        and math.isfinite(v)
+                    ):
+                        continue
+
+                    if start is not None and t < start - 1:
+                        continue
+
+                    if end is not None and t > end + 1:
+                        continue
+
+                    original_points.append([t, v])
+
+                except (ValueError, TypeError, OverflowError):
+                    continue
+
+            original_points.sort(key=lambda p: p[0])
+
+            # Remove duplicate timestamps.
+            deduped = {}
+
+            for t, v in original_points:
+                deduped[t] = v
+
+            original_points = [
+                [t, v]
+                for t, v in sorted(deduped.items())
+            ]
+
+            if not original_points:
+                continue
+
+            raw_max = max(
+                raw_max,
+                max(abs(p[1]) for p in original_points),
+            )
+
+            parsed_series.append({
+                "name": self.metric_name(metric, index),
+                "originalCount": len(original_points),
+                "rawPoints": original_points,
+            })
+
+        if not parsed_series:
             return None
 
-        if data.get("resultType") != "matrix":
-            return None
-
-        if not isinstance(data.get("result"), list):
-            return None
-
-        return data
-
-    @staticmethod
-    def chart_unit(output_type):
-
-        t = str(output_type or "").lower()
-
-        if "memory" in t or "byte" in t:
-            return "MiB", 1024 * 1024
-
-        if "cpu" in t:
-            return "CPU cores", 1
-
-        if "percent" in t or "percentage" in t:
-            return "%", 1
-
-        return "Value", 1
-
-    @staticmethod
-    def chart_html(job):
-
-        params = job.get("params") or {}
-        matrix = job.get("matrix") or {}
-
-        unit, divisor = Pipe.chart_unit(
-            params.get("output_type")
+        unit, divisor = self.determine_unit(
+            params,
+            raw_max,
         )
 
         series = []
 
-        for item in matrix.get("result", [])[:4]:
+        for s in parsed_series:
 
-            if not isinstance(item, dict):
-                continue
-
-            metric = item.get("metric") or {}
-            values = item.get("values") or []
-
-            points = []
-
-            for pair in values[:240]:
-
-                try:
-                    timestamp = float(pair[0])
-                    value = float(pair[1]) / divisor
-
-                    if not (
-                        math.isfinite(timestamp)
-                        and math.isfinite(value)
-                    ):
-                        continue
-
-                    points.append((timestamp, value))
-
-                except (TypeError, ValueError, IndexError):
-                    continue
-
-            if not points:
-                continue
-
-            name = (
-                metric.get("pod")
-                or metric.get("container")
-                or metric.get("instance")
-                or metric.get("job")
-                or "Series"
+            points = self.compact_points(
+                s["rawPoints"],
+                self.valves.MAX_POINTS_PER_SERIES,
             )
+
+            converted = [
+                [t, v / divisor]
+                for t, v in points
+            ]
+
+            full_values = [
+                v / divisor
+                for _, v in s["rawPoints"]
+            ]
 
             series.append({
-                "name": str(name),
-                "points": points,
+                "name": s["name"],
+                "points": converted,
+                "originalCount": s["originalCount"],
+                "current": full_values[-1],
+                "average": sum(full_values) / len(full_values),
+                "maximum": max(full_values),
+                "minimum": min(full_values),
             })
 
-        if not series:
-            return None
-
-        all_points = [
-            point
-            for s in series
-            for point in s["points"]
-        ]
-
-        min_x = min(p[0] for p in all_points)
-        max_x = max(p[0] for p in all_points)
-
-        min_y = min(p[1] for p in all_points)
-        max_y = max(p[1] for p in all_points)
-
-        if min_x == max_x:
-            max_x = min_x + 1
-
-        # Include zero for nonnegative CPU / Memory values.
-        if min_y >= 0:
-            min_y = 0
-
-        if min_y == max_y:
-            max_y = min_y + 1
-
-        padding_y = (max_y - min_y) * 0.08
-        max_y += padding_y
-
-        width = 1000
-        height = 400
-
-        left = 76
-        right = 30
-        top = 24
-        bottom = 62
-
-        plot_width = width - left - right
-        plot_height = height - top - bottom
-
-        def sx(t):
-            return (
-                left
-                + (t - min_x)
-                / (max_x - min_x)
-                * plot_width
-            )
-
-        def sy(v):
-            return (
-                top
-                + (max_y - v)
-                / (max_y - min_y)
-                * plot_height
-            )
-
-        colors = [
-            "#38bdf8",
-            "#34d399",
-            "#fbbf24",
-            "#c084fc",
-        ]
-
-        svg_parts = []
-
-        # Y-axis grid
-        for i in range(5):
-
-            value = min_y + (max_y - min_y) * i / 4
-            y = sy(value)
-
-            svg_parts.append(
-                f'<line x1="{left}" y1="{y:.2f}" '
-                f'x2="{width-right}" y2="{y:.2f}" '
-                'stroke="#334155" stroke-width="1" '
-                'stroke-dasharray="4 5"/>'
-            )
-
-            svg_parts.append(
-                f'<text x="{left-12}" y="{y+4:.2f}" '
-                'text-anchor="end" '
-                'fill="#cbd5e1" font-size="14">'
-                f'{value:.2f}</text>'
-            )
-
-        tw_tz = timezone(timedelta(hours=8))
-
-        # X-axis labels
-        for i in range(5):
-
-            t = min_x + (max_x - min_x) * i / 4
-            x = sx(t)
-
-            label = datetime.fromtimestamp(
-                t,
-                tz=tw_tz,
-            ).strftime("%H:%M")
-
-            svg_parts.append(
-                f'<text x="{x:.2f}" y="{height-30}" '
-                'text-anchor="middle" '
-                'fill="#cbd5e1" font-size="14">'
-                f'{label}</text>'
-            )
-
-        # Data series
-        for idx, s in enumerate(series):
-
-            color = colors[idx]
-
-            coords = " ".join(
-                f"{sx(t):.2f},{sy(v):.2f}"
-                for t, v in s["points"]
-            )
-
-            svg_parts.append(
-                f'<polyline points="{coords}" '
-                'fill="none" '
-                f'stroke="{color}" '
-                'stroke-width="2.6" '
-                'stroke-linecap="round" '
-                'stroke-linejoin="round"/>'
-            )
-
-        # Legend
-        legend_items = []
-
-        for idx, s in enumerate(series):
-
-            color = colors[idx]
-            name = html.escape(s["name"])
-
-            legend_items.append(
-                '<div class="legend-item">'
-                f'<span class="dot" style="background:{color}"></span>'
-                f'<span>{name}</span>'
-                '</div>'
-            )
-
-        query = html.escape(
-            str(params.get("query") or "")
+        actual_start = min(
+            s["rawPoints"][0][0]
+            for s in parsed_series
         )
 
-        description = html.escape(
-            str(
+        actual_end = max(
+            s["rawPoints"][-1][0]
+            for s in parsed_series
+        )
+
+        question_lower = str(question).lower()
+
+        # Horizontal Bar compares the latest value of
+        # several series. Time Bars represent time samples.
+        comparison_terms = (
+            "比較", "各pod", "各 pod",
+            "排名", "排行", "top",
+            "compare", "ranking",
+        )
+
+        horizontal_terms = (
+            "bar chart", "長條圖", "橫條圖",
+            "horizontal bar",
+        )
+
+        if (
+            any(t in question_lower for t in horizontal_terms)
+            and (
+                len(series) > 1
+                or any(t in question_lower for t in comparison_terms)
+            )
+        ):
+            default_style = "horizontal"
+        elif (
+            "柱狀圖" in question_lower
+            or "時間柱" in question_lower
+            or "bars" in question_lower
+        ):
+            default_style = "bars"
+        elif (
+            "面積圖" in question_lower
+            or "area chart" in question_lower
+        ):
+            default_style = "area"
+        elif (
+            "散點" in question_lower
+            or "points" in question_lower
+        ):
+            default_style = "points"
+        elif any(t in question_lower for t in horizontal_terms):
+            default_style = "bars"
+        else:
+            default_style = "line"
+
+        return {
+            "title": str(
                 params.get("description")
                 or "Prometheus Trend"
-            )
+            )[:240],
+            "query": str(params.get("query") or "")[:4000],
+            "unit": unit,
+            "defaultStyle": default_style,
+            "queryStart": start,
+            "queryEnd": end,
+            "actualStart": actual_start,
+            "actualEnd": actual_end,
+            "series": series,
+        }
+
+    # =========================================================
+    # Interactive HTML chart
+    # =========================================================
+
+    @staticmethod
+    def chart_html(payload):
+
+        # Escape unsafe characters in JSON embedded in HTML.
+        data_json = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
         )
 
-        unit_safe = html.escape(unit)
-
-        total_points = sum(
-            len(s["points"]) for s in series
+        data_json = (
+            data_json
+            .replace("&", "\\u0026")
+            .replace("<", "\\u003c")
+            .replace(">", "\\u003e")
         )
 
-        svg = "".join(svg_parts)
-        legends = "".join(legend_items)
-
-        return f"""<!doctype html>
+        template = r"""<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-* {{ box-sizing:border-box; }}
-html,body {{
-    margin:0;
-    padding:0;
-    width:100%;
-    overflow:hidden;
-    background:transparent;
-    color:#e2e8f0;
-    font-family:system-ui,sans-serif;
-}}
-.card {{
-    background:#0f172a;
-    border:1px solid #334155;
-    border-radius:12px;
-    padding:16px;
-    width:100%;
-}}
-.title {{
-    font-weight:600;
-    font-size:16px;
-    margin-bottom:5px;
-    overflow-wrap:anywhere;
-}}
-.subtitle {{
-    color:#94a3b8;
-    font-size:12px;
-    margin-bottom:12px;
-}}
-svg {{
-    display:block;
-    width:100%;
-    height:auto;
-}}
-.legend {{
-    display:flex;
-    flex-wrap:wrap;
-    gap:12px;
-    margin-top:10px;
-}}
-.legend-item {{
-    display:flex;
-    align-items:center;
-    gap:6px;
-    font-size:12px;
-    overflow-wrap:anywhere;
-}}
-.dot {{
-    width:10px;
-    height:10px;
-    border-radius:50%;
-    flex-shrink:0;
-}}
-.details {{
-    margin-top:12px;
-    font-size:12px;
-    color:#94a3b8;
-}}
-code {{
-    white-space:pre-wrap;
-    overflow-wrap:anywhere;
-    color:#cbd5e1;
-}}
+*{box-sizing:border-box}
+html,body{
+ margin:0;padding:0;overflow:hidden;width:100%;
+ font-family:system-ui,-apple-system,sans-serif;
+ color:#e2e8f0;background:transparent
+}
+.card{
+ background:#101827;border:1px solid #334155;
+ border-radius:12px;padding:16px;width:100%;
+}
+.header{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.title{font-size:16px;font-weight:650;overflow-wrap:anywhere}
+.subtitle{font-size:12px;color:#9ca3af;margin-top:4px}
+.controls{display:flex;gap:5px;flex-wrap:wrap;margin:12px 0}
+.controls button{
+ background:#253349;border:1px solid #45556b;
+ border-radius:7px;color:#e2e8f0;
+ padding:7px 11px;cursor:pointer;font-size:12px
+}
+.controls button.active{
+ background:#155e75;border-color:#22d3ee;color:white
+}
+.plot{
+ position:relative;width:100%;height:330px;
+ touch-action:pan-y
+}
+canvas{width:100%;height:100%;display:block}
+.tooltip{
+ position:absolute;z-index:10;pointer-events:none;
+ display:none;background:#020617ee;
+ border:1px solid #64748b;border-radius:8px;
+ padding:10px;font-size:12px;max-width:280px;
+ box-shadow:0 8px 20px #0007;
+}
+.tooltip .dt{color:#cbd5e1;font-weight:600;margin-bottom:6px}
+.tooltip .item{display:flex;gap:8px;justify-content:space-between}
+.legend{display:flex;gap:12px;flex-wrap:wrap;margin-top:10px}
+.legend span{font-size:12px;overflow-wrap:anywhere}
+.swatch{
+ display:inline-block;width:10px;height:10px;
+ border-radius:3px;margin-right:5px
+}
+.stats{
+ display:flex;gap:12px;flex-wrap:wrap;
+ font-size:12px;color:#cbd5e1;margin-top:12px
+}
+.stat{
+ background:#1e293b;padding:8px 10px;
+ border-radius:7px;min-width:100px
+}
+.stat b{display:block;font-size:15px;color:#f8fafc;margin-top:4px}
+details{margin-top:12px;font-size:12px;color:#94a3b8}
+pre{white-space:pre-wrap;overflow-wrap:anywhere}
+.notice{font-size:12px;color:#fbbf24;margin-top:8px}
 </style>
 </head>
 <body>
 <div class="card">
-  <div class="title">{description}</div>
-  <div class="subtitle">
-    單位：{unit_safe} · 台灣時間 UTC+8 · {total_points} 個資料點
+ <div class="header">
+  <div>
+   <div class="title" id="title"></div>
+   <div class="subtitle" id="subtitle"></div>
   </div>
-  <svg viewBox="0 0 {width} {height}"
-       xmlns="http://www.w3.org/2000/svg"
-       role="img"
-       aria-label="{description}">
-    {svg}
-  </svg>
-  <div class="legend">{legends}</div>
-  <details class="details">
-    <summary>查看 PromQL</summary>
-    <code>{query}</code>
-  </details>
+ </div>
+ <div class="controls" id="controls">
+  <button data-style="line">Line 折線</button>
+  <button data-style="area">Area 面積</button>
+  <button data-style="bars">Bars 柱狀</button>
+  <button data-style="points">Points 散點</button>
+  <button data-style="horizontal">Bar 比較</button>
+ </div>
+ <div class="plot" id="plot">
+  <canvas id="chart"></canvas>
+  <div class="tooltip" id="tooltip"></div>
+ </div>
+ <div class="legend" id="legend"></div>
+ <div class="stats" id="stats"></div>
+ <div class="notice" id="notice"></div>
+ <details>
+  <summary>查看實際 PromQL</summary>
+  <pre id="promql"></pre>
+ </details>
 </div>
 <script>
-(function() {{
-    function reportHeight() {{
-        var h = Math.ceil(
-            document.documentElement.scrollHeight
-        );
-        parent.postMessage(
-            {{type:"iframe:height",height:h}},
-            "*"
-        );
-    }}
-    window.addEventListener("load", reportHeight);
-    window.addEventListener("resize", reportHeight);
-    if (typeof ResizeObserver !== "undefined") {{
-        new ResizeObserver(reportHeight).observe(
-            document.body
-        );
-    }}
-    reportHeight();
-}})();
+(function(){
+"use strict";
+
+const DATA = __PAYLOAD__;
+const colors=[
+ "#22d3ee","#34d399","#fbbf24","#c084fc",
+ "#fb7185","#60a5fa","#f97316","#a3e635",
+ "#f472b6","#2dd4bf","#eab308","#818cf8",
+ "#f87171","#38bdf8","#4ade80","#facc15",
+ "#a78bfa","#fda4af","#67e8f9","#d8b4fe"
+];
+
+const canvas=document.getElementById("chart");
+const plot=document.getElementById("plot");
+const tooltip=document.getElementById("tooltip");
+const controls=document.getElementById("controls");
+const ctx=canvas.getContext("2d");
+let style=DATA.defaultStyle||"line";
+let geometry=null;
+let hover=null;
+
+const tzFormatter=new Intl.DateTimeFormat("zh-TW",{
+ timeZone:"Asia/Taipei",
+ year:"numeric",month:"2-digit",day:"2-digit",
+ hour:"2-digit",minute:"2-digit",second:"2-digit",
+ hour12:false,hourCycle:"h23"
+});
+
+const shortFormatter=new Intl.DateTimeFormat("zh-TW",{
+ timeZone:"Asia/Taipei",
+ hour:"2-digit",minute:"2-digit",
+ hour12:false,hourCycle:"h23"
+});
+
+function fullTime(t){
+ return tzFormatter.format(new Date(t*1000));
+}
+function shortTime(t){
+ return shortFormatter.format(new Date(t*1000));
+}
+function fmt(v){
+ if(!Number.isFinite(v))return "N/A";
+ const a=Math.abs(v);
+ if(a>=1000)return v.toLocaleString("en-US",{maximumFractionDigits:2});
+ if(a>=1)return v.toFixed(3);
+ return v.toFixed(5);
+}
+function escapeHtml(s){
+ return String(s).replace(/[&<>"']/g,c=>({
+  "&":"&amp;","<":"&lt;",">":"&gt;",
+  '"':"&quot;","'":"&#39;"
+ })[c]);
+}
+function reportHeight(){
+ parent.postMessage({
+  type:"iframe:height",
+  height:Math.ceil(document.documentElement.scrollHeight)
+ },"*");
+}
+function allPoints(){
+ return DATA.series.flatMap(s=>s.points);
+}
+
+document.getElementById("title").textContent=DATA.title;
+document.getElementById("promql").textContent=DATA.query;
+
+const duration=(DATA.actualEnd-DATA.actualStart)/60;
+document.getElementById("subtitle").textContent=
+ "單位："+DATA.unit+
+ " · 台灣時間 UTC+8 · 實際資料："+
+ fullTime(DATA.actualStart)+" ～ "+fullTime(DATA.actualEnd)+
+ " · 約 "+duration.toFixed(1)+" 分鐘";
+
+let legend=document.getElementById("legend");
+
+DATA.series.forEach((s,i)=>{
+ let item=document.createElement("span");
+ let swatch=document.createElement("span");
+ swatch.className="swatch";
+ swatch.style.background=colors[i%colors.length];
+ item.appendChild(swatch);
+ item.appendChild(document.createTextNode(s.name));
+ legend.appendChild(item);
+});
+
+const stats=document.getElementById("stats");
+if(DATA.series.length===1){
+ const s=DATA.series[0];
+ [
+  ["最新樣本",s.current],
+  ["樣本平均",s.average],
+  ["樣本最大",s.maximum],
+  ["樣本最小",s.minimum]
+ ].forEach(([label,value])=>{
+  const el=document.createElement("div");
+  el.className="stat";
+  const heading=document.createElement("span");
+  heading.textContent=label;
+  const num=document.createElement("b");
+  num.textContent=fmt(value)+" "+DATA.unit;
+  el.append(heading,num);
+  stats.appendChild(el);
+ });
+}
+
+const notice=document.getElementById("notice");
+
+if(DATA.queryStart!=null&&DATA.queryEnd!=null){
+ const requested=DATA.queryEnd-DATA.queryStart;
+ const actual=DATA.actualEnd-DATA.actualStart;
+ if(requested>0&&actual<requested*0.75){
+  notice.textContent=
+   "注意：實際資料僅涵蓋部分查詢時間範圍，請確認指標是否缺漏。";
+ }
+}
+const sampled=DATA.series.some(
+ s=>s.originalCount>s.points.length
+);
+if(sampled){
+ notice.textContent+=
+  (notice.textContent?" ":"")+
+  "圖形已對顯示點數抽樣；統計值使用抽樣前的資料。";
+}
+
+function resizeCanvas(){
+ const rect=plot.getBoundingClientRect();
+ const dpr=Math.min(window.devicePixelRatio||1,2);
+ const w=Math.max(320,rect.width);
+ const h=Math.max(250,rect.height);
+ canvas.width=Math.round(w*dpr);
+ canvas.height=Math.round(h*dpr);
+ ctx.setTransform(dpr,0,0,dpr,0,0);
+ return {w,h};
+}
+
+function plotBounds(w,h){
+ return {
+  left:74,right:w-22,top:18,bottom:h-50
+ };
+}
+
+function draw(){
+ const {w,h}=resizeCanvas();
+ ctx.clearRect(0,0,w,h);
+ ctx.font="12px system-ui";
+ ctx.textBaseline="middle";
+
+ const b=plotBounds(w,h);
+ const points=allPoints();
+
+ if(!points.length)return;
+
+ const horizontal=style==="horizontal";
+
+ if(horizontal){
+  drawHorizontal(w,h);
+  reportHeight();
+  return;
+ }
+
+ const minX=Math.min(...points.map(p=>p[0]));
+ const maxX=Math.max(...points.map(p=>p[0]));
+ const minV=Math.min(...points.map(p=>p[1]));
+ const maxV=Math.max(...points.map(p=>p[1]));
+
+ const low=Math.min(0,minV);
+ const hi=Math.max(maxV,low+0.000001);
+ const span=hi-low;
+ const yTop=hi+span*0.12;
+
+ const sx=t=>b.left+
+  (t-minX)/Math.max(1,maxX-minX)*(b.right-b.left);
+
+ const sy=v=>b.bottom-
+  (v-low)/(yTop-low)*(b.bottom-b.top);
+
+ geometry={b,sx,sy,minX,maxX,low,yTop,horizontal:false};
+
+ ctx.strokeStyle="#334155";
+ ctx.fillStyle="#cbd5e1";
+ ctx.lineWidth=1;
+
+ for(let i=0;i<=4;i++){
+  const v=low+(yTop-low)*i/4;
+  const y=sy(v);
+  ctx.beginPath();
+  ctx.moveTo(b.left,y);
+  ctx.lineTo(b.right,y);
+  ctx.stroke();
+  ctx.textAlign="right";
+  ctx.fillText(fmt(v),b.left-9,y);
+ }
+
+ for(let i=0;i<=4;i++){
+  const t=minX+(maxX-minX)*i/4;
+  ctx.textAlign="center";
+  ctx.fillText(
+   shortTime(t),
+   sx(t),
+   b.bottom+20
+  );
+ }
+
+ DATA.series.forEach((s,i)=>{
+  const c=colors[i%colors.length];
+  ctx.strokeStyle=c;
+  ctx.fillStyle=c;
+  ctx.lineWidth=2.2;
+
+  if(style==="bars"){
+   const base=sy(0);
+   const barW=Math.max(
+    1.5,
+    Math.min(18,(b.right-b.left)/
+     Math.max(1,s.points.length*DATA.series.length)*0.75)
+   );
+   s.points.forEach(p=>{
+    const x=sx(p[0])+
+     (i-(DATA.series.length-1)/2)*barW;
+    const y=sy(p[1]);
+    ctx.globalAlpha=.85;
+    ctx.fillRect(x-barW/2,Math.min(y,base),barW,Math.max(1,Math.abs(base-y)));
+   });
+   ctx.globalAlpha=1;
+  }else{
+   if(style==="area"){
+    ctx.beginPath();
+    s.points.forEach((p,j)=>{
+     if(j===0)ctx.moveTo(sx(p[0]),sy(0));
+     ctx.lineTo(sx(p[0]),sy(p[1]));
+    });
+    const last=s.points[s.points.length-1];
+    ctx.lineTo(sx(last[0]),sy(0));
+    ctx.closePath();
+    ctx.globalAlpha=.18;
+    ctx.fill();
+    ctx.globalAlpha=1;
+   }
+
+   if(style!=="points"){
+    ctx.beginPath();
+    s.points.forEach((p,j)=>{
+     if(j===0)ctx.moveTo(sx(p[0]),sy(p[1]));
+     else ctx.lineTo(sx(p[0]),sy(p[1]));
+    });
+    ctx.stroke();
+   }
+
+   if(style==="points"){
+    s.points.forEach(p=>{
+     ctx.beginPath();
+     ctx.arc(sx(p[0]),sy(p[1]),3,0,Math.PI*2);
+     ctx.fill();
+    });
+   }
+  }
+ });
+
+ if(hover&&hover.timestamp!=null){
+  const x=sx(hover.timestamp);
+  ctx.strokeStyle="#e2e8f0";
+  ctx.setLineDash([4,4]);
+  ctx.beginPath();
+  ctx.moveTo(x,b.top);
+  ctx.lineTo(x,b.bottom);
+  ctx.stroke();
+  ctx.setLineDash([]);
+ }
+
+ reportHeight();
+}
+
+function drawHorizontal(w,h){
+ const rows=DATA.series.map((s,i)=>({
+  name:s.name,
+  value:s.current,
+  color:colors[i%colors.length]
+ })).sort((a,b)=>b.value-a.value);
+
+ const max=Math.max(
+  0.000001,
+  ...rows.map(r=>Math.abs(r.value))
+ );
+
+ const left=Math.min(225,w*0.42);
+ const right=w-24;
+ const top=18;
+ const rowH=32;
+
+ plot.style.height=Math.max(
+  270,rows.length*rowH+65
+ )+"px";
+
+ const adjusted=resizeCanvas();
+ const W=adjusted.w;
+
+ const usable=W-left-26;
+
+ ctx.clearRect(0,0,adjusted.w,adjusted.h);
+ ctx.font="12px system-ui";
+ ctx.textBaseline="middle";
+
+ geometry={
+  horizontal:true,
+  rows,
+  left,top,rowH
+ };
+
+ rows.forEach((r,i)=>{
+  const y=top+i*rowH;
+  ctx.fillStyle="#cbd5e1";
+  ctx.textAlign="right";
+  let label=r.name;
+  if(label.length>29)label=label.slice(0,26)+"...";
+  ctx.fillText(label,left-12,y+11);
+
+  ctx.fillStyle=r.color;
+  ctx.fillRect(
+   left,y+2,
+   Math.max(1,Math.abs(r.value)/max*usable),
+   19
+  );
+
+  ctx.fillStyle="#e2e8f0";
+  ctx.textAlign="left";
+  const txt=fmt(r.value);
+  ctx.fillText(
+   txt,
+   Math.min(
+    W-60,
+    left+Math.abs(r.value)/max*usable+5
+   ),
+   y+11
+  );
+ });
+}
+
+function findNearest(t,series){
+ const p=series.points;
+ if(!p.length)return null;
+ let best=p[0];
+ let dist=Math.abs(best[0]-t);
+ for(let i=1;i<p.length;i++){
+  const delta=Math.abs(p[i][0]-t);
+  if(delta<dist){
+   best=p[i];
+   dist=delta;
+  }
+ }
+ return best;
+}
+
+function moveTooltip(event){
+ if(!geometry)return;
+
+ const rect=canvas.getBoundingClientRect();
+ const x=event.clientX-rect.left;
+ const y=event.clientY-rect.top;
+ let content="";
+
+ if(geometry.horizontal){
+  const idx=Math.floor(
+   (y-geometry.top)/geometry.rowH
+  );
+  const row=geometry.rows[idx];
+
+  if(!row){
+   tooltip.style.display="none";
+   return;
+  }
+
+  content=
+   '<div class="dt">'+escapeHtml(row.name)+'</div>'+
+   '<div>'+fmt(row.value)+" "+escapeHtml(DATA.unit)+'</div>'+
+   '<div style="color:#94a3b8;margin-top:5px">'+
+   '最新有效樣本</div>';
+
+ }else{
+  const g=geometry;
+  if(x<g.b.left||x>g.b.right||
+     y<g.b.top||y>g.b.bottom){
+   tooltip.style.display="none";
+   hover=null;
+   draw();
+   return;
+  }
+
+  const ts=g.minX+
+   (x-g.b.left)/(g.b.right-g.b.left)*
+   (g.maxX-g.minX);
+
+  let nearest=null;
+  let best=Infinity;
+
+  DATA.series.forEach(s=>{
+   const p=findNearest(ts,s);
+   if(!p)return;
+   const distance=Math.abs(p[0]-ts);
+   if(distance<best){
+    best=distance;
+    nearest=p;
+   }
+  });
+
+  if(!nearest)return;
+
+  const exact=nearest[0];
+  hover={timestamp:exact};
+
+  content=
+   '<div class="dt">'+escapeHtml(fullTime(exact))+
+   " (UTC+8)</div>";
+
+  DATA.series.forEach((s,i)=>{
+   const p=findNearest(exact,s);
+   if(!p)return;
+
+   // Do not display a distant sample
+   // as if it were at the hovered timestamp.
+   const all=s.points;
+   let cadence=Infinity;
+   for(let k=1;k<all.length;k++){
+    cadence=Math.min(
+     cadence,
+     all[k][0]-all[k-1][0]
+    );
+   }
+
+   const tolerance=Number.isFinite(cadence)?
+    Math.max(cadence*.75,1):1;
+
+   if(Math.abs(p[0]-exact)>tolerance)return;
+
+   content+=
+    '<div class="item"><span>'+
+    '<span class="swatch" style="background:'+
+    colors[i%colors.length]+'"></span>'+
+    escapeHtml(s.name)+
+    '</span><b>'+
+    fmt(p[1])+" "+escapeHtml(DATA.unit)+
+    '</b></div>';
+  });
+
+  draw();
+ }
+
+ tooltip.innerHTML=content;
+ tooltip.style.display="block";
+
+ const tipW=Math.min(280,tooltip.offsetWidth||240);
+ const tipH=tooltip.offsetHeight||90;
+
+ tooltip.style.left=Math.max(
+  3,Math.min(x+15,rect.width-tipW-5)
+ )+"px";
+
+ tooltip.style.top=Math.max(
+  3,Math.min(y+12,rect.height-tipH-5)
+ )+"px";
+}
+
+canvas.addEventListener("pointermove",moveTooltip);
+
+canvas.addEventListener("pointerleave",()=>{
+ hover=null;
+ tooltip.style.display="none";
+ draw();
+});
+
+controls.querySelectorAll("button").forEach(btn=>{
+ btn.addEventListener("click",()=>{
+  style=btn.dataset.style;
+  plot.style.height=style==="horizontal"?
+   Math.max(270,DATA.series.length*32+65)+"px":
+   "330px";
+
+  controls.querySelectorAll("button").forEach(b=>{
+   b.classList.toggle(
+    "active",
+    b.dataset.style===style
+   );
+  });
+
+  tooltip.style.display="none";
+  hover=null;
+  draw();
+ });
+});
+
+const active=controls.querySelector(
+ '[data-style="'+style+'"]'
+);
+if(active)active.classList.add("active");
+
+if(style==="horizontal"){
+ plot.style.height=Math.max(
+  270,DATA.series.length*32+65
+ )+"px";
+}
+
+window.addEventListener("resize",draw);
+window.addEventListener("load",()=>{
+ draw();
+ reportHeight();
+});
+if(typeof ResizeObserver!=="undefined"){
+ new ResizeObserver(()=>{
+  draw();
+  reportHeight();
+ }).observe(document.body);
+}
+draw();
+reportHeight();
+
+})();
 </script>
 </body>
 </html>"""
 
+        return template.replace("__PAYLOAD__", data_json)
+
     # =========================================================
-    # Grafana
+    # Grafana PNG rendering
     # =========================================================
 
     @staticmethod
-    def safe_time(value, fallback):
+    def safe_grafana_time(value, default):
 
-        value = str(value or fallback)
+        value = str(value or default)
 
         if re.fullmatch(
             r"(?:now(?:-[0-9]{1,4}[smhdw])?|[0-9]{13})",
@@ -480,49 +1128,54 @@ code {{
         ):
             return value
 
-        return fallback
+        return default
 
-    def grafana_request(self, job):
+    def grafana_render_params(self, job):
 
-        params = job["params"]
         tool = job["tool"]
+        params = job["params"]
 
         uid = str(
             params.get("dashboard_uid") or ""
-        )
+        ).strip()
 
-        if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", uid):
-            raise ValueError("Invalid Dashboard UID")
+        if not re.fullmatch(
+            r"[A-Za-z0-9_-]{1,80}",
+            uid,
+        ):
+            raise ValueError("Invalid dashboard UID")
 
         if tool == "grafana_render_panel":
-
             panel_id = int(params.get("panel_id") or 0)
 
             if not 1 <= panel_id <= 100000:
-                raise ValueError("Invalid panel_id")
+                raise ValueError("Invalid panel ID")
 
             path = f"render/d-solo/{quote(uid, safe='')}/_"
             title = f"Grafana Panel {panel_id}"
 
-        else:
+        elif tool == "grafana_render_dashboard":
             panel_id = None
             path = f"render/d/{quote(uid, safe='')}/_"
             title = "Grafana Dashboard"
 
+        else:
+            raise ValueError("Unsupported Grafana tool")
+
         query = {
             "orgId": self.valves.GRAFANA_ORG_ID,
-            "from": self.safe_time(
+            "from": self.safe_grafana_time(
                 params.get("from_time"), "now-1h"
             ),
-            "to": self.safe_time(
+            "to": self.safe_grafana_time(
                 params.get("to_time"), "now"
             ),
             "width": min(
-                max(int(params.get("width") or 1000), 400),
+                max(int(params.get("width") or 1000),400),
                 1400,
             ),
             "height": min(
-                max(int(params.get("height") or 500), 250),
+                max(int(params.get("height") or 500),250),
                 900,
             ),
             "theme": (
@@ -537,36 +1190,37 @@ code {{
 
         tz = str(params.get("timezone") or "")
 
-        if re.fullmatch(r"[A-Za-z0-9_+./-]{1,64}", tz):
+        if re.fullmatch(r"[A-Za-z0-9_+./-]{1,64}",tz):
             query["tz"] = tz
 
         variables = params.get("variables")
 
-        if isinstance(variables, str):
-
+        if isinstance(variables,str):
             for pair in variables.split(";")[:12]:
-
                 if "=" not in pair:
                     continue
 
-                key, val = (
+                key,value = [
                     x.strip()
-                    for x in pair.split("=", 1)
-                )
+                    for x in pair.split("=",1)
+                ]
 
-                if re.fullmatch(
-                    r"var-[A-Za-z0-9_-]{1,64}", key
-                ) and re.fullmatch(
-                    r"[A-Za-z0-9_.:/ -]{1,128}", val
+                if (
+                    re.fullmatch(
+                        r"var-[A-Za-z0-9_-]{1,64}",key
+                    )
+                    and re.fullmatch(
+                        r"[A-Za-z0-9_.:/ -]{1,128}",value
+                    )
                 ):
-                    query[key] = val
+                    query[key] = value
 
-        return title, path, query
+        return title,path,query
 
     @staticmethod
-    def grafana_html(title, image_b64):
+    def grafana_embed(title,image64):
 
-        safe_title = html.escape(title, quote=True)
+        safe_title = html.escape(title,quote=True)
 
         return (
             '<!doctype html><html><head>'
@@ -574,7 +1228,6 @@ code {{
             '<meta name="viewport" '
             'content="width=device-width,initial-scale=1">'
             '<style>'
-            '*{box-sizing:border-box}'
             'html,body{margin:0;padding:0;'
             'width:100%;overflow:hidden;'
             'background:transparent}'
@@ -582,7 +1235,7 @@ code {{
             'height:auto;max-width:100%}'
             '</style></head><body>'
             f'<img id="grafana" alt="{safe_title}" '
-            f'src="data:image/png;base64,{image_b64}">'
+            f'src="data:image/png;base64,{image64}">'
             '<script>'
             '(function(){'
             'function resize(){'
@@ -602,7 +1255,7 @@ code {{
         )
 
     # =========================================================
-    # Main
+    # Open WebUI Pipe
     # =========================================================
 
     async def pipe(
@@ -613,7 +1266,7 @@ code {{
         __task__=None,
     ):
 
-        # Keep original admin-only restriction.
+        # Keep the existing admin-only security boundary.
 
         if not __user__ or __user__.get("role") != "admin":
             return "Access denied: administrator access required."
@@ -621,44 +1274,45 @@ code {{
         if __task__:
             return "HolmesGPT SRE"
 
-        messages = body.get("messages", [])
+        messages = body.get("messages") or []
 
         questions = [
-            m["content"]
+            m.get("content")
             for m in messages
-            if m.get("role") == "user"
-            and isinstance(m.get("content"), str)
+            if (
+                m.get("role") == "user"
+                and isinstance(m.get("content"),str)
+            )
         ]
 
-        if not questions:
+        if not questions or not questions[-1].strip():
             return "請輸入 Kubernetes 維運問題。"
 
         question = questions[-1].strip()
 
-        if not question:
-            return "請輸入 Kubernetes 維運問題。"
-
         system_prompt = "\n\n".join(
-            m["content"]
+            m.get("content","")
             for m in messages
-            if m.get("role") == "system"
-            and isinstance(m.get("content"), str)
+            if (
+                m.get("role") == "system"
+                and isinstance(m.get("content"),str)
+            )
         )
 
         headers = {
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
+            "Content-Type":"application/json",
+            "Accept":"text/event-stream",
         }
 
         if self.valves.API_KEY:
             headers["X-API-Key"] = self.valves.API_KEY
 
         payload = {
-            "model": self.valves.MODEL,
-            "ask": question,
-            "stream": True,
-            "enable_tool_approval": False,
-            "additional_system_prompt": system_prompt,
+            "model":self.valves.MODEL,
+            "ask":question,
+            "stream":True,
+            "enable_tool_approval":False,
+            "additional_system_prompt":system_prompt,
         }
 
         holmes_url = (
@@ -666,37 +1320,36 @@ code {{
             + "/api/chat"
         )
 
-        tool_history = []
-        tool_params_by_id = {}
-
+        history = []
+        params_by_id = {}
         grafana_jobs = []
-        prometheus_jobs = {}
+        prom_jobs = {}
 
         seen_grafana = set()
 
         final_answer = None
         pending_event = ""
-        pending_data = []
+        pending_lines = []
 
-        async def status(message, done=False):
+        async def status(message,done=False):
 
             if __event_emitter__:
                 await __event_emitter__({
-                    "type": "status",
-                    "data": {
-                        "description": message,
-                        "done": done,
-                        "hidden": False,
+                    "type":"status",
+                    "data":{
+                        "description":message,
+                        "done":done,
+                        "hidden":False,
                     },
                 })
 
-        async def handle_event(event_type, data):
+        async def handle_event(event_type,data):
 
             nonlocal final_answer
 
             if event_type == "start_tool_calling":
 
-                tool = (
+                name = (
                     data.get("tool_name")
                     or data.get("name")
                     or "unknown"
@@ -713,21 +1366,21 @@ code {{
                     or {}
                 )
 
-                if call_id and isinstance(params, dict):
-                    tool_params_by_id[call_id] = params
+                if call_id and isinstance(params,dict):
+                    params_by_id[call_id] = params
 
-                tool_history.append({
-                    "tool": tool,
-                    "status": "running",
-                    "id": call_id,
-                    "message": "執行中",
+                history.append({
+                    "tool":name,
+                    "call_id":call_id,
+                    "status":"running",
+                    "message":"執行中",
                 })
 
-                await status(f"正在執行 {tool}...")
+                await status(f"正在執行 {name}...")
 
             elif event_type == "tool_calling_result":
 
-                tool = (
+                name = (
                     data.get("name")
                     or data.get("tool_name")
                     or "unknown"
@@ -740,153 +1393,122 @@ code {{
 
                 result = data.get("result") or {}
 
-                if not isinstance(result, dict):
+                if not isinstance(result,dict):
                     result = {}
 
                 params = (
                     result.get("params")
                     or data.get("params")
-                    or tool_params_by_id.get(call_id)
+                    or params_by_id.get(call_id)
                     or {}
                 )
 
-                if not isinstance(params, dict):
+                if not isinstance(params,dict):
                     params = {}
 
                 outcome = str(
                     result.get("status") or "unknown"
                 ).lower()
 
-                error = result.get("error")
+                error = str(
+                    result.get("error") or ""
+                )
 
-                # Some HolmesGPT Kubernetes tools place
-                # subprocess errors inside data.stderr
-                # even when status is "success".
+                raw_data = self.parse_object(
+                    result.get("data")
+                )
 
-                stderr = ""
+                stderr = str(
+                    raw_data.get("stderr") or ""
+                )
 
-                raw_data = result.get("data")
-
-                if isinstance(raw_data, dict):
-                    stderr = str(
-                        raw_data.get("stderr") or ""
-                    )
-
-                elif isinstance(raw_data, str):
-
-                    try:
-                        parsed = json.loads(raw_data)
-
-                        if isinstance(parsed, dict):
-                            stderr = str(
-                                parsed.get("stderr") or ""
-                            )
-                    except json.JSONDecodeError:
-                        pass
-
-                if re.search(
-                    r"runtime: out of memory|"
-                    r"fatal error: out of memory|"
-                    r"Unable to find resource kind",
-                    stderr,
-                    flags=re.IGNORECASE,
+                if (
+                    "runtime: out of memory" in stderr.lower()
+                    or "fatal error: out of memory" in stderr.lower()
+                    or "unable to find resource kind" in stderr.lower()
                 ):
                     outcome = "error"
                     error = stderr.splitlines()[0]
 
                 if outcome == "success":
-                    message = f"{tool} 查詢完成"
+                    message = f"{name} 執行成功"
                 else:
                     message = (
-                        f"{tool} 失敗："
-                        f"{str(error or stderr or 'unknown')[:150]}"
+                        f"{name} 失敗："
+                        f"{(error or stderr or 'unknown')[:160]}"
                     )
 
                 matched = False
 
-                for item in reversed(tool_history):
+                for item in reversed(history):
 
                     if item["status"] != "running":
                         continue
 
                     if (
-                        (call_id and item["id"] == call_id)
-                        or item["tool"] == tool
+                        (call_id and item["call_id"] == call_id)
+                        or item["tool"] == name
                     ):
-
                         item.update(
                             status=outcome,
                             message=message,
                         )
-                        matched = True
+                        matched=True
                         break
 
                 if not matched:
-                    tool_history.append({
-                        "tool": tool,
-                        "status": outcome,
-                        "id": call_id,
-                        "message": message,
+                    history.append({
+                        "tool":name,
+                        "call_id":call_id,
+                        "status":outcome,
+                        "message":message,
                     })
 
-                # ---------------------------------------------
-                # Prometheus range query:
-                # Store only validated matrix data.
-                # ---------------------------------------------
-
+                # Prometheus matrix
                 if (
-                    self.valves.SHOW_PROMETHEUS_CHARTS
+                    name == "execute_prometheus_range_query"
                     and outcome == "success"
-                    and tool == "execute_prometheus_range_query"
                     and call_id
+                    and self.valves.SHOW_PROMETHEUS_CHARTS
                 ):
 
-                    matrix = self.decode_prometheus_result(
+                    matrix = self.decode_prometheus_matrix(
                         result
                     )
 
                     if (
-                        matrix
-                        and len(prometheus_jobs)
-                        < self.valves.MAX_CHARTS
+                        matrix is not None
+                        and len(prom_jobs) < self.valves.MAX_CHARTS
                     ):
-
-                        prometheus_jobs[call_id] = {
-                            "params": dict(params),
-                            "matrix": matrix,
+                        prom_jobs[call_id] = {
+                            "params":dict(params),
+                            "matrix":matrix,
                         }
 
-                # ---------------------------------------------
-                # Grafana rendering jobs
-                # ---------------------------------------------
-
+                # Existing Grafana rendering
                 if (
                     self.valves.SHOW_RENDERED_IMAGES
                     and outcome == "success"
-                    and tool in {
+                    and name in {
                         "grafana_render_panel",
                         "grafana_render_dashboard",
                     }
                 ):
 
                     key = json.dumps(
-                        {
-                            "tool": tool,
-                            "params": params,
-                        },
+                        {"tool":name,"params":params},
                         sort_keys=True,
                         ensure_ascii=False,
                     )
 
                     if (
                         key not in seen_grafana
-                        and len(grafana_jobs)
-                        < self.valves.MAX_IMAGES
+                        and len(grafana_jobs)<self.valves.MAX_IMAGES
                     ):
                         seen_grafana.add(key)
                         grafana_jobs.append({
-                            "tool": tool,
-                            "params": dict(params),
+                            "tool":name,
+                            "params":dict(params),
                         })
 
                 await status(message)
@@ -914,40 +1536,40 @@ code {{
                         data.get("message")
                         or data.get("error")
                         or "unknown"
-                    )[:140]
+                    )[:160]
                 )
 
         async def process_sse():
 
-            nonlocal pending_event, pending_data
+            nonlocal pending_event,pending_lines
 
-            if not pending_data:
-                pending_event = ""
+            if not pending_lines:
+                pending_event=""
                 return
 
-            raw = "\n".join(pending_data)
+            raw = "\n".join(pending_lines)
             event_type = pending_event or "message"
 
-            pending_event = ""
-            pending_data = []
+            pending_event=""
+            pending_lines=[]
 
             if raw == "[DONE]":
                 return
 
             try:
-                data = json.loads(raw)
-            except json.JSONDecodeError:
+                data=json.loads(raw)
+            except (ValueError,TypeError):
                 return
 
-            if isinstance(data, dict):
-                await handle_event(event_type, data)
+            if isinstance(data,dict):
+                await handle_event(event_type,data)
 
         try:
 
             await status("HolmesGPT 正在開始調查")
 
-            timeout = httpx.Timeout(
-                timeout=float(self.valves.TIMEOUT),
+            timeout=httpx.Timeout(
+                float(self.valves.TIMEOUT),
                 connect=10.0,
             )
 
@@ -975,110 +1597,118 @@ code {{
                             continue
 
                         if line.startswith("event:"):
-                            pending_event = line[6:].strip()
+                            pending_event=line[6:].strip()
 
                         elif line.startswith("data:"):
-                            pending_data.append(
+                            pending_lines.append(
                                 line[5:].lstrip()
                             )
 
                     await process_sse()
 
             if not final_answer:
-
                 await status(
-                    "HolmesGPT 未回傳最終回答",
+                    "HolmesGPT 沒有完整回答",
                     done=True,
                 )
-
                 return "HolmesGPT 未回傳完整調查結果。"
 
-            output = str(final_answer)
+            output=str(final_answer)
 
             if self.valves.REMOVE_TOOL_IMAGE_REFERENCES:
-                output = self.clean_images(output)
+                output=self.remove_tool_image_refs(output)
 
-            # =================================================
-            # Render PromQL markers
-            # =================================================
+            # ---------------------------------------------
+            # Remove confirmed PromQL reference markers
+            # while preserving a readable chart location.
+            # ---------------------------------------------
 
-            promql_pattern = re.compile(
+            used_ids=[]
+
+            marker_pattern=re.compile(
                 r"<<\s*(\{.*?\})\s*>>",
-                flags=re.DOTALL,
+                re.DOTALL,
             )
 
-            referenced_ids = []
-
-            def replace_promql_marker(match):
+            def replace_marker(match):
 
                 try:
-                    marker = json.loads(match.group(1))
-                except json.JSONDecodeError:
+                    marker=json.loads(match.group(1))
+                except ValueError:
                     return match.group(0)
 
-                if marker.get("type") != "promql":
+                if marker.get("type")!="promql":
                     return match.group(0)
 
-                call_id = marker.get("tool_call_id")
+                call_id=marker.get("tool_call_id")
 
-                if call_id in prometheus_jobs:
-                    referenced_ids.append(call_id)
-                    return "（Prometheus 趨勢圖附於下方）"
+                if call_id in prom_jobs:
+                    used_ids.append(call_id)
+                    return "（互動式趨勢圖顯示於回答上方）"
 
-                return (
-                    "（未取得可繪製的 Prometheus "
-                    "時間序列資料）"
-                )
+                return "（此圖表未取得有效時間序列資料）"
 
-            output = promql_pattern.sub(
-                replace_promql_marker,
+            output=marker_pattern.sub(
+                replace_marker,
                 output,
             )
 
-            # =================================================
-            # Emit Prometheus chart embeds
-            # =================================================
+            # ---------------------------------------------
+            # Emit Prometheus charts
+            # ---------------------------------------------
 
-            shown_charts = 0
+            shown_charts=0
+            chart_failures=[]
 
             if (
                 self.valves.SHOW_PROMETHEUS_CHARTS
                 and __event_emitter__
             ):
 
-                chart_ids = list(dict.fromkeys(
-                    referenced_ids
-                    + list(prometheus_jobs.keys())
+                ordered_ids=list(dict.fromkeys(
+                    used_ids+list(prom_jobs.keys())
                 ))
 
-                for call_id in chart_ids[
-                    :self.valves.MAX_CHARTS
-                ]:
+                for call_id in ordered_ids[:self.valves.MAX_CHARTS]:
 
-                    job = prometheus_jobs.get(call_id)
+                    try:
+                        job=prom_jobs[call_id]
 
-                    if not job:
-                        continue
+                        chart_data=self.make_chart_data(
+                            job,
+                            question,
+                        )
 
-                    chart = self.chart_html(job)
+                        if not chart_data:
+                            chart_failures.append(
+                                "查詢沒有可繪製的有效資料點"
+                            )
+                            continue
 
-                    if not chart:
-                        continue
+                        chart=self.chart_html(chart_data)
 
-                    await __event_emitter__({
-                        "type": "embeds",
-                        "data": {
-                            "embeds": [chart],
-                        },
-                    })
+                        await __event_emitter__({
+                            "type":"embeds",
+                            "data":{"embeds":[chart]},
+                        })
 
-                    shown_charts += 1
+                        shown_charts+=1
 
-            # =================================================
-            # Render Grafana PNG
-            # =================================================
+                    except (
+                        ValueError,
+                        TypeError,
+                        OverflowError,
+                    ) as exc:
+                        chart_failures.append(
+                            type(exc).__name__
+                        )
 
-            shown_grafana = 0
+            # ---------------------------------------------
+            # Render Grafana PNG from known service URL
+            # ---------------------------------------------
+
+            shown_grafana=0
+            grafana_failures=[]
 
             if (
                 grafana_jobs
@@ -1086,14 +1716,12 @@ code {{
                 and self.valves.GRAFANA_TOKEN
             ):
 
-                grafana_headers = {
-                    "Authorization": (
-                        "Bearer " + self.valves.GRAFANA_TOKEN
-                    ),
-                    "X-Grafana-Org-Id": str(
-                        self.valves.GRAFANA_ORG_ID
-                    ),
-                    "Accept": "image/png",
+                render_headers={
+                    "Authorization":
+                        "Bearer "+self.valves.GRAFANA_TOKEN,
+                    "X-Grafana-Org-Id":
+                        str(self.valves.GRAFANA_ORG_ID),
+                    "Accept":"image/png",
                 }
 
                 async with httpx.AsyncClient(
@@ -1102,88 +1730,89 @@ code {{
                         connect=10.0,
                     ),
                     follow_redirects=False,
-                ) as grafana_client:
+                ) as client:
 
                     for job in grafana_jobs:
 
                         try:
-
-                            title, path, query = (
-                                self.grafana_request(job)
+                            title,path,query=(
+                                self.grafana_render_params(job)
                             )
 
-                            url = (
+                            url=(
                                 self.valves.GRAFANA_URL.rstrip("/")
-                                + "/"
-                                + path
+                                +"/"+path
                             )
 
-                            response = await grafana_client.get(
+                            response=await client.get(
                                 url,
                                 params=query,
-                                headers=grafana_headers,
+                                headers=render_headers,
                             )
 
                             response.raise_for_status()
 
-                            png = response.content
+                            png=response.content
+
+                            if (
+                                response.headers.get(
+                                    "Content-Type",""
+                                ).split(";")[0].strip().lower()
+                                != "image/png"
+                            ):
+                                raise ValueError("Not PNG")
 
                             if not png.startswith(
                                 b"\x89PNG\r\n\x1a\n"
                             ):
                                 raise ValueError("Invalid PNG")
 
-                            if (
-                                len(png)
-                                > self.valves.MAX_IMAGE_BYTES
-                            ):
+                            if len(png)>self.valves.MAX_IMAGE_BYTES:
                                 raise ValueError("PNG too large")
 
-                            image_b64 = base64.b64encode(
+                            encoded=base64.b64encode(
                                 png
                             ).decode("ascii")
 
-                            embed = self.grafana_html(
+                            embed=self.grafana_embed(
                                 title,
-                                image_b64,
+                                encoded,
                             )
 
                             await __event_emitter__({
-                                "type": "embeds",
-                                "data": {
-                                    "embeds": [embed],
-                                },
+                                "type":"embeds",
+                                "data":{"embeds":[embed]},
                             })
 
-                            shown_grafana += 1
+                            shown_grafana+=1
 
                         except (
                             httpx.HTTPError,
                             ValueError,
                             TypeError,
                             OverflowError,
-                        ):
-                            continue
+                        ) as exc:
+                            grafana_failures.append(
+                                type(exc).__name__
+                            )
 
-            # =================================================
+            # ---------------------------------------------
             # Tool history
-            # =================================================
+            # ---------------------------------------------
 
-            if self.valves.SHOW_TOOL_HISTORY and tool_history:
+            if self.valves.SHOW_TOOL_HISTORY and history:
 
-                lines = [
+                lines=[
                     "",
                     "---",
                     "### 工具執行紀錄",
                 ]
 
-                for i, item in enumerate(
-                    tool_history[:30], 1
-                ):
+                for i,item in enumerate(history[:30],1):
 
-                    symbol = (
+                    symbol=(
                         "✓"
-                        if item["status"] == "success"
+                        if item["status"]=="success"
                         else "!"
                     )
 
@@ -1193,18 +1822,30 @@ code {{
                         f"{item['message']}"
                     )
 
-                output += "\n".join(lines)
+                output+="\n".join(lines)
 
             if shown_charts:
-                output += (
+                output+=(
                     f"\n\n已附上 {shown_charts} 張 "
-                    "Prometheus 趨勢圖。"
+                    "Prometheus 互動式圖表。"
                 )
 
             if shown_grafana:
-                output += (
+                output+=(
                     f"\n\n已附上 {shown_grafana} 張 "
-                    "Grafana 渲染圖片。"
+                    "Grafana 圖片。"
+                )
+
+            if chart_failures:
+                output+=(
+                    "\n\n> 部分趨勢圖未能產生："
+                    + "、".join(chart_failures)
+                )
+
+            if grafana_failures:
+                output+=(
+                    "\n\n> 部分 Grafana 圖片失敗："
+                    + "、".join(grafana_failures)
                 )
 
             await status(
@@ -1216,12 +1857,12 @@ code {{
 
         except httpx.TimeoutException:
 
-            await status("HolmesGPT 調查逾時", done=True)
+            await status("HolmesGPT 調查逾時",done=True)
             return "HolmesGPT 調查逾時。"
 
         except httpx.HTTPStatusError as exc:
 
-            await status("HolmesGPT API 錯誤", done=True)
+            await status("HolmesGPT HTTP 錯誤",done=True)
             return (
                 "HolmesGPT HTTP 錯誤："
                 + str(exc.response.status_code)
@@ -1229,12 +1870,12 @@ code {{
 
         except httpx.RequestError:
 
-            await status("HolmesGPT 連線失敗", done=True)
+            await status("HolmesGPT 連線失敗",done=True)
             return "無法連線 HolmesGPT API。"
 
         except Exception as exc:
 
-            await status("Pipe 執行失敗", done=True)
+            await status("Pipe 執行失敗",done=True)
             return (
                 "Pipe 處理錯誤："
                 + type(exc).__name__
